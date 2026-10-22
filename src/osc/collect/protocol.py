@@ -32,8 +32,11 @@ class ReasoningBackend(Protocol):
     def continue_steps(
         self, prompt: str, thinking_prefix: str, k: int, max_tokens: int
     ) -> list[str]:
-        """Sample ``k`` independent next-step continuations of ``thinking_prefix``, each
-        cut at the backend's step delimiter (one reasoning step, without the delimiter)."""
+        """Sample ``k`` independent raw continuations of ``thinking_prefix`` (up to
+        ``max_tokens`` each, stopping early if the model closes its thinking), using the
+        same sampling parameters as ``generate_thinking``. The caller cuts each into one
+        step with the same causal rule used to segment full traces, so sibling steps
+        share the law of the trace's actual next step (required by the dual bound)."""
         ...
 
     def complete(self, prompt: str, thinking_prefix: str, probe: str, max_tokens: int) -> str:
