@@ -73,3 +73,17 @@ def test_checked_spans_and_empty_prefix_anchor():
     assert event.anchor_step == 0
     assert not event.span_found
     assert AnchorEvent("p", 0, 0, "42", (0, 0), None, False).span_found
+
+
+def test_answer_after_first_correct_run_does_not_hide_flip():
+    from dataclasses import replace
+
+    trace = replace(
+        make_trace((1, 1, 0, 1), answers=("42", "42", "42", "42")),
+        step_texts=("", "still thinking. ", "reconsider. ", "answer 42. "),
+    )
+    event = find_anchor_events(TraceSet((trace,)))[0]
+    assert event.anchor_step == 0
+    assert event.flip_step == 2
+    assert not event.span_found
+    assert not event.persistent

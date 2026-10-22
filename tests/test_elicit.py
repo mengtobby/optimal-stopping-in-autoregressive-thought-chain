@@ -102,11 +102,11 @@ def test_censored_exclusions_and_override():
     capped = make_trace()
     traces = TraceSet((natural, censored, capped))
     backend = Backend()
-    stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=4)
+    stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=3)
     assert (stats.n_traces, stats.n_excluded) == (1, 2)
     assert len(backend.prefixes) == 3
     included = run_elicitation_pilot(
-        Backend(), traces, {"p": "prompt"}, max_steps=4, include_censored=True
+        Backend(), traces, {"p": "prompt"}, max_steps=3, include_censored=True
     )
     assert (included.n_traces, included.n_excluded) == (3, 0)
     excluded = run_elicitation_pilot(Backend(), TraceSet((censored,)), {})
@@ -129,3 +129,23 @@ def test_invalid_censor_mask(mask):
 def test_invalid_max_steps(max_steps):
     with pytest.raises(ElicitationError, match="max_steps"):
         run_elicitation_pilot(Backend(), TraceSet((make_trace(),)), {}, max_steps=max_steps)
+
+
+def test_collection_limit_boundary_and_metadata_fallback():
+    traces = TraceSet(
+        (make_trace((0, 1, 1)), make_trace()), metadata={"collect_config": {"max_steps": 3}}
+    )
+    for max_steps in (None, 3):
+        backend = Backend()
+        stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=max_steps)
+        assert (stats.n_traces, stats.n_excluded) == (1, 1)
+        assert len(backend.prefixes) == 3
+    overridden = run_elicitation_pilot(Backend(), traces, {"p": "prompt"}, max_steps=4)
+    assert (overridden.n_traces, overridden.n_excluded) == (2, 0)
+
+
+@pytest.mark.parametrize("config", [None, [], {"max_steps": True}, {"max_steps": 0}])
+def test_invalid_collection_metadata(config):
+    traces = TraceSet((make_trace(),), metadata={"collect_config": config})
+    with pytest.raises(ElicitationError):
+        run_elicitation_pilot(Backend(), traces, {"p": "prompt"})

@@ -57,6 +57,7 @@ def locate_answer_span_checked(
 
 
 def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[AnchorEvent, ...]:
+    """Locate anchors within the first correct run and retain that run's first flip."""
     if not np.isfinite(threshold) or not 0 <= threshold <= 1:
         raise AnchorError("threshold must be finite and in [0, 1]")
     events = []
@@ -69,9 +70,13 @@ def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[Anchor
         if not anchors:
             continue
         t = anchors[0]
+        later = np.flatnonzero(trace.forced_correct[t + 1 :] < threshold)
+        flip = t + 1 + int(later[0]) if later.size else None
         ends = step_ends(trace)
         thinking = thinking_text(trace)
         for candidate in anchors:
+            if flip is not None and candidate >= flip:
+                break
             candidate_answer = trace.forced_answers[candidate].strip()
             _, found = locate_answer_span_checked(
                 thinking,
@@ -83,8 +88,6 @@ def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[Anchor
                 t = candidate
                 break
         answer = trace.forced_answers[t].strip()
-        later = np.flatnonzero(trace.forced_correct[t + 1 :] < threshold)
-        flip = t + 1 + int(later[0]) if later.size else None
         span, found = locate_answer_span_checked(
             thinking, int(ends[t - 1]) if t else 0, int(ends[t]), answer
         )
