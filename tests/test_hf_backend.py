@@ -38,3 +38,14 @@ def test_tiny_model_features_and_attention():
     assert masses.shape == (3, 2, 2)
     assert (masses[0] == 0).all()
     assert ((masses >= 0) & (masses <= 1)).all()
+
+
+def test_attention_version_guard(monkeypatch):
+    import sys
+    import types
+
+    from osc.collect.hf_backend import BackendError, HFBackend
+
+    monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
+    with pytest.raises(BackendError, match=r"transformers>=4\.51"):
+        HFBackend.__new__(HFBackend).attention_to_span("q", "a", (0, 1), [1])
