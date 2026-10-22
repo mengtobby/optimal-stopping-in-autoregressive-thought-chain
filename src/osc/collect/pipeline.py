@@ -92,7 +92,8 @@ def collect_trace_with_stats(
         if not config.k_siblings or t % config.sibling_stride:
             continue
         prefix = thinking[: ends[t]]
-        remaining = config.max_thinking_tokens - backend.count_tokens(prefix)
+        prefix_tokens = backend.count_tokens(prefix)
+        remaining = config.max_thinking_tokens - prefix_tokens
         cap = min(config.sibling_max_tokens, remaining)
         if cap <= 0:
             n_no_budget += 1
@@ -104,7 +105,8 @@ def collect_trace_with_stats(
         n_draws += len(raw)
         steps = []
         for partial in raw:
-            used = backend.count_tokens(partial)
+            total_tokens = backend.count_tokens(prefix + partial)
+            used = total_tokens - prefix_tokens
             extended = False
             while True:
                 # A short draw ended thinking; apply the same causal boundary as the outer step.
@@ -115,7 +117,7 @@ def collect_trace_with_stats(
                 step = first_step(partial, config.segment_mode, config.min_chars)
                 if len(step) < len(partial):
                     break
-                left = remaining - backend.count_tokens(partial)
+                left = config.max_thinking_tokens - total_tokens
                 if left <= 0:
                     n_truncated += 1
                     break
@@ -124,7 +126,9 @@ def collect_trace_with_stats(
                 if len(more) != 1:
                     raise CollectionError("backend returned an incorrect number of siblings")
                 partial += more[0]
-                used = backend.count_tokens(more[0])
+                previous_tokens = total_tokens
+                total_tokens = backend.count_tokens(prefix + partial)
+                used = total_tokens - previous_tokens
                 extended = True
             n_extended += int(extended)
             steps.append(step)

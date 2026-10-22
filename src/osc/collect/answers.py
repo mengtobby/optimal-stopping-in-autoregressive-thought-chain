@@ -22,6 +22,7 @@ def extract_boxed(text: str) -> str | None:
 
 
 def normalize_answer(ans: str) -> str:
+    ans = ans.replace("{,}", ",").replace(r"\,", ",")
     ans = ans.strip().replace("$", "").replace("\\left", "").replace("\\right", "")
     ans = ans.replace("\\!", "").replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
     ans = re.sub(r"\\text\{([^{}]*)\}", r"\1", ans)
@@ -55,6 +56,7 @@ def is_equivalent(pred: str | None, gold: str) -> bool:
         return False
 
     def elements(value: str) -> list[str] | None:
+        value = value.replace("{,}", ",").replace(r"\,", ",")
         if "," in value and (
             re.search(r",\s", value)
             or not re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", normalize_answer(value))
