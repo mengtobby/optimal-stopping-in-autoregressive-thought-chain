@@ -28,11 +28,19 @@ class AnchorEvent:
     span: tuple[int, int]
     flip_step: int | None
     persistent: bool
+    span_found: bool = True
 
 
 def locate_answer_span(
     thinking: str, step_start: int, step_end: int, answer: str
 ) -> tuple[int, int]:
+    return locate_answer_span_checked(thinking, step_start, step_end, answer)[0]
+
+
+def locate_answer_span_checked(
+    thinking: str, step_start: int, step_end: int, answer: str
+) -> tuple[tuple[int, int], bool]:
+    """Locate an answer in the prefix, flagging the fallback step span as missing."""
     if not 0 <= step_start <= step_end <= len(thinking):
         raise AnchorError("step offsets must satisfy 0 <= start <= end <= len(thinking)")
     if not answer.strip():
@@ -43,9 +51,9 @@ def locate_answer_span(
     # A boxed occurrence covers the whole expression, including its answer substring.
     candidates = [(pos, value) for pos, value in candidates if pos >= 0]
     if not candidates:
-        return step_start, step_end
+        return (step_start, step_end), False
     pos, value = max(candidates, key=lambda item: (item[0] + len(item[1]), len(item[1])))
-    return pos, pos + len(value)
+    return (pos, pos + len(value)), True
 
 
 def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[AnchorEvent, ...]:
@@ -61,12 +69,24 @@ def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[Anchor
         if not anchors:
             continue
         t = anchors[0]
+        ends = step_ends(trace)
+        thinking = thinking_text(trace)
+        for candidate in anchors:
+            candidate_answer = trace.forced_answers[candidate].strip()
+            _, found = locate_answer_span_checked(
+                thinking,
+                int(ends[candidate - 1]) if candidate else 0,
+                int(ends[candidate]),
+                candidate_answer,
+            )
+            if found:
+                t = candidate
+                break
         answer = trace.forced_answers[t].strip()
         later = np.flatnonzero(trace.forced_correct[t + 1 :] < threshold)
         flip = t + 1 + int(later[0]) if later.size else None
-        ends = step_ends(trace)
-        span = locate_answer_span(
-            thinking_text(trace), int(ends[t - 1]) if t else 0, int(ends[t]), answer
+        span, found = locate_answer_span_checked(
+            thinking, int(ends[t - 1]) if t else 0, int(ends[t]), answer
         )
         events.append(
             AnchorEvent(
@@ -77,6 +97,7 @@ def find_anchor_events(traces: TraceSet, threshold: float = 0.5) -> tuple[Anchor
                 span,
                 flip,
                 bool(flip is not None and np.all(trace.forced_correct[flip:] < threshold)),
+                found,
             )
         )
     return tuple(events)

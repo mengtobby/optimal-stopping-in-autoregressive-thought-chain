@@ -55,3 +55,21 @@ def test_span_and_empty_answers():
         locate_answer_span("abc", 2, 1, "a")
     with pytest.raises(AnchorError):
         locate_answer_span("abc", 0, 1, " ")
+
+
+def test_checked_spans_and_empty_prefix_anchor():
+    from osc.pilots.flips import AnchorEvent, locate_answer_span_checked
+
+    assert locate_answer_span_checked("", 0, 0, "42") == ((0, 0), False)
+    assert locate_answer_span_checked("abc", 0, 3, "42") == ((0, 3), False)
+    text = r"then \boxed{42}"
+    assert locate_answer_span_checked(text, 0, len(text), "42") == ((5, len(text)), True)
+    trace = make_trace((1, 1, 0), answers=("42", "42", "42"))
+    event = find_anchor_events(TraceSet((trace,)))[0]
+    assert event.anchor_step == 1
+    assert event.span_found
+    missing = make_trace((1, 1), answers=("99", "99"))
+    event = find_anchor_events(TraceSet((missing,)))[0]
+    assert event.anchor_step == 0
+    assert not event.span_found
+    assert AnchorEvent("p", 0, 0, "42", (0, 0), None, False).span_found
