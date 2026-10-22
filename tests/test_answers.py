@@ -41,6 +41,9 @@ def test_grading():
     "left,right,expected",
     [
         ("1, 2", "12", False),
+        ("1, 100", "1100", False),
+        ("1, 234", "1234", False),
+        ("10, 100", "10100", False),
         ("1,234", "1234", True),
         ("1,2", "1, 2", True),
         ("1,2", "2,1", False),
@@ -51,3 +54,8 @@ def test_grading():
 )
 def test_comma_answers(left, right, expected):
     assert is_equivalent(left, right) is expected
+    assert is_equivalent(right, left) is expected
+
+
+def test_boxed_thousands():
+    assert is_equivalent(extract_boxed(r"\boxed{1,000}"), "1000")
