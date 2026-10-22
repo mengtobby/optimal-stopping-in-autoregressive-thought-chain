@@ -126,3 +126,39 @@ def test_pipeline_import_is_lazy():
         env={**os.environ, "PYTHONPATH": "src"},
         check=True,
     )
+
+
+@pytest.mark.parametrize("extend", [False, True])
+def test_ended_thinking_uses_outer_step_boundary(extend):
+    from osc.collect.pipeline import collect_trace_with_stats
+    from osc.collect.segment import first_step
+
+    text = "AAAA\n\nB" if extend else "A\n\nB"
+    cap = 4 if extend else 8
+
+    class Scripted(FakeBackend):
+        def continue_steps(self, prompt, thinking_prefix, k, max_tokens):
+            if extend:
+                return [text[len(thinking_prefix) :][:max_tokens]] * k
+            return [text] * k
+
+    backend = Scripted(
+        thinking=text,
+        answers={
+            "": [r"\boxed{0}"],
+            first_step(text, min_chars=0): [r"\boxed{1}"],
+            text: [r"\boxed{0}"],
+        },
+    )
+    trace, stats = collect_trace_with_stats(
+        backend,
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, k_siblings=2, sibling_max_tokens=cap, sibling_stride=2),
+    )
+    sibling = trace.siblings[0]
+    assert trace.step_texts[1] == first_step(text, min_chars=0)
+    assert sibling.step_tokens.tolist() == [int(trace.step_tokens[1])] * 2
+    assert sibling.forced_correct.tolist() == [1.0, 1.0]
+    assert (sibling.features == trace.features[1]).all()
+    assert stats.n_ended_thinking == 2
+    assert stats.n_extended == (2 if extend else 0)

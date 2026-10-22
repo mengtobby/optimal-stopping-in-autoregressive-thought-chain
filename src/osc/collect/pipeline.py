@@ -108,10 +108,10 @@ def collect_trace_with_stats(
             while True:
                 if used > cap:
                     raise CollectionError("backend continuation exceeds its token cap")
-                # A short draw ended thinking: retain its entire final step.
+                # A short draw ended thinking; apply the same causal boundary as the outer step.
                 if used < cap:
                     n_ended += 1
-                    step = partial
+                    step = first_step(partial, config.segment_mode, config.min_chars)
                     break
                 step = first_step(partial, config.segment_mode, config.min_chars)
                 if len(step) < len(partial):
