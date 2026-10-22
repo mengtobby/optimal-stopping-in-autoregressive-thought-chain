@@ -56,6 +56,8 @@ class HeadroomReport:
     irreducible_gap: float
     headroom: float
     notes: tuple[str, ...]
+    headroom_paired: float = float("nan")
+    headroom_paired_ci: tuple[float, float] = (float("nan"), float("nan"))
 
 
 _DEFAULT_LSM_CONFIG = LSMConfig()
@@ -70,11 +72,14 @@ def headroom_report(
     lsm_config: LSMConfig = _DEFAULT_LSM_CONFIG,
     budget_quantiles: tuple[float, ...] = tuple(i / 10 for i in range(1, 10)),
     convergence_ks: tuple[int, ...] = (2, 3, 4),
+    exact_stop_times: np.ndarray | None = None,
 ) -> HeadroomReport:
     """Evaluate held-out policies; oracle rows deliberately use ground truth.
 
     Dual rows are bounds, not stopping policies, so their accuracy/token fields
     are undefined. Bootstrap intervals condition on the fitted fold policies.
+    Paired headroom bootstraps dual_i - payoff_i(tau_i) on the same paths;
+    pathwise this difference is at least -M_i(tau_i).
     """
     if not budget_quantiles or any(not 0 <= q <= 1 for q in budget_quantiles):
         raise HeadroomError("budget_quantiles must be nonempty and lie in [0, 1]")
@@ -103,6 +108,8 @@ def headroom_report(
             )
         )
 
+    if exact_stop_times is not None:
+        add("exact-optimal", "oracle", exact_stop_times)
     prophet = hindsight_prophet(panel)
     add("hindsight-prophet", "oracle", prophet.stop_times)
     add("oracle-Samuel-Cahn", "oracle", threshold_stop_times(panel, samuel_cahn_threshold(panel)))
@@ -149,11 +156,16 @@ def headroom_report(
     lower = rows[-1].value
     notes = ["Intervals condition on fitted policies; they do not include training uncertainty."]
     upper, se = float("nan"), float("nan")
+    paired = float("nan")
+    paired_ci = (float("nan"), float("nan"))
     if any(trace.has_siblings for trace in traces):
         values = np.empty(len(traces))
         for fold, policy in enumerate(policies):
             indices = np.flatnonzero(folds == fold)
             values[indices] = dual_upper_bound(panel.subset(indices), policy.value).per_trace
+        differences = values - panel.payoff[np.arange(len(traces)), lsm_times]
+        paired = float(differences.mean())
+        paired_ci = bootstrap_mean_ci(differences, seed=seed)
         upper = float(values.mean())
         se = float(values.std(ddof=1) / np.sqrt(len(values)))
         rows.append(
@@ -182,6 +194,8 @@ def headroom_report(
         prophet.value - upper,
         upper - best,
         tuple(notes),
+        paired,
+        paired_ci,
     )
 
 
@@ -226,12 +240,17 @@ def report_to_markdown(report: HeadroomReport) -> str:
             f"Dual upper: {number(report.dual_upper)} (SE {number(report.dual_upper_se)}). "
             f"LSM lower: {number(report.lsm_lower)}. "
             f"Irreducible gap: {number(report.irreducible_gap)}. "
-            f"Headroom: {number(report.headroom)}.",
+            f"Headroom: {number(report.headroom)}. "
+            f"Paired headroom: {number(report.headroom_paired)} "
+            f"(95% CI [{number(report.headroom_paired_ci[0])}, "
+            f"{number(report.headroom_paired_ci[1])}]).",
             "",
             "Hindsight can choose after seeing the future. The dual upper bound limits "
             "what an observable stopping policy can achieve, while held-out LSM gives an "
             "achievable lower estimate. The hindsight-minus-dual gap measures the estimated "
-            "cost of lacking future information; headroom is the dual minus the best "
+            "cost of lacking future information; paired headroom is the mean per-trace "
+            "dual minus LSM payoff, with a paired bootstrap interval. "
+            "Headroom is the dual minus the best "
             "evaluated implementable policy. Sampling noise can reverse estimated gaps.",
             "",
         ]

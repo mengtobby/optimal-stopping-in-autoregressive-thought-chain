@@ -7,9 +7,11 @@ from osc.stopping.payoff import build_panel
 from osc.stopping.synthetic import (
     SyntheticError,
     default_model,
+    exact_optimal_stop_times,
     exact_state_value_fn,
     exact_value,
     exact_value_function,
+    overthinking_model,
     sample_traceset,
 )
 
@@ -97,3 +99,60 @@ def test_exact_values_validation_and_decoder():
     ]:
         with pytest.raises(SyntheticError):
             fn(t, features, tokens)
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.6])
+def test_overthinking_state_dependence_and_partial_observability(noise):
+    from osc.stopping.baselines import answer_convergence_stop_times
+    from osc.stopping.dual import dual_upper_bound
+    from osc.stopping.lsm import cross_fit_lsm
+
+    model = overthinking_model(noise)
+    traces = sample_traceset(model, 3000, 8, 42)
+    panel = build_panel(traces, 0.05)
+    rows = np.arange(len(traces))
+    times, policies, folds = cross_fit_lsm(panel)
+    learned = panel.payoff[rows, times].mean()
+    exact = exact_value(model, 0.05)
+    dual = np.empty(len(traces))
+    for fold, policy in enumerate(policies):
+        indices = np.flatnonzero(folds == fold)
+        dual[indices] = dual_upper_bound(panel.subset(indices), policy.value).per_trace
+    assert dual.mean() >= exact - 3 * dual.std(ddof=1) / np.sqrt(len(traces))
+    assert panel.payoff[rows, panel.horizons - 1].mean() < learned
+    for k in (2, 3, 4):
+        assert panel.payoff[rows, answer_convergence_stop_times(panel, k)].mean() < learned
+    if noise == 0:
+        optimal = exact_optimal_stop_times(model, 0.05, traces)
+        outcomes = panel.payoff[rows, optimal]
+        assert abs(outcomes.mean() - exact) < 3 * outcomes.std(ddof=1) / np.sqrt(len(traces))
+        assert optimal.std() >= 1.0
+        fixed = max(
+            panel.payoff[rows, np.minimum(step, panel.horizons - 1)].mean()
+            for step in range(model.t_max)
+        )
+        assert exact >= fixed + 0.03
+        assert exact >= panel.payoff[rows, panel.horizons - 1].mean() + 0.05
+        assert abs(learned - exact) < 0.03
+    else:
+        assert learned <= exact - 0.01
+        with pytest.raises(SyntheticError, match="feature_noise"):
+            exact_optimal_stop_times(model, 0.05, traces)
+
+
+def test_exact_stop_times_validation_and_observables():
+    from osc.data.schema import TraceSet
+
+    model = default_model()
+    traces = sample_traceset(model, 20, 0, 7)
+    changed = TraceSet(tuple(replace(t, forced_correct=1 - t.forced_correct) for t in traces))
+    np.testing.assert_array_equal(
+        exact_optimal_stop_times(model, 0.05, traces),
+        exact_optimal_stop_times(model, 0.05, changed),
+    )
+    for invalid_model in (replace(model, t_max=1), overthinking_model()):
+        with pytest.raises(SyntheticError, match="dimensions"):
+            exact_optimal_stop_times(invalid_model, 0.05, traces)
+    noisy = sample_traceset(replace(model, feature_noise=0.01), 10, 0, 7)
+    with pytest.raises(SyntheticError, match="one-hot"):
+        exact_optimal_stop_times(model, 0.05, noisy)
