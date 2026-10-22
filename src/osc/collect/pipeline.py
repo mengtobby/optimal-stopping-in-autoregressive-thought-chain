@@ -58,6 +58,7 @@ class SiblingStats:
     n_extended: int
     n_ended_thinking: int
     n_budget_truncated: int
+    n_no_budget: int = 0
 
 
 def collect_trace(backend: ReasoningBackend, problem: Problem, config: CollectConfig) -> Trace:
@@ -81,21 +82,21 @@ def collect_trace_with_stats(
     features = backend.hidden_features(problem.prompt, thinking, ends)
     siblings: list[SiblingSet | None] = [None] * len(texts)
     tokens = np.array([backend.count_tokens(s) for s in texts])
-    cumulative = np.cumsum(tokens)
     merged = len(segment_thinking(thinking, config.segment_mode, config.min_chars, None)) > len(
         spans
     )
-    n_with = n_draws = n_extended = n_ended = n_truncated = 0
+    n_with = n_draws = n_extended = n_ended = n_truncated = n_no_budget = 0
     for t in range(len(texts) - 1):
         if merged and t == len(texts) - 2:
             continue
         if not config.k_siblings or t % config.sibling_stride:
             continue
         prefix = thinking[: ends[t]]
-        remaining = config.max_thinking_tokens - int(cumulative[t])
+        remaining = config.max_thinking_tokens - backend.count_tokens(prefix)
         cap = min(config.sibling_max_tokens, remaining)
         if cap <= 0:
-            raise CollectionError("outer transition has no remaining thinking budget")
+            n_no_budget += 1
+            continue
         raw = backend.continue_steps(problem.prompt, prefix, config.k_siblings, cap)
         if len(raw) != config.k_siblings:
             raise CollectionError("backend returned an incorrect number of siblings")
@@ -106,8 +107,6 @@ def collect_trace_with_stats(
             used = backend.count_tokens(partial)
             extended = False
             while True:
-                if used > cap:
-                    raise CollectionError("backend continuation exceeds its token cap")
                 # A short draw ended thinking; apply the same causal boundary as the outer step.
                 if used < cap:
                     n_ended += 1
@@ -153,7 +152,16 @@ def collect_trace_with_stats(
         correct[-1],
         tuple(siblings),
     )
-    return trace, SiblingStats(len(texts) - 1, n_with, n_draws, n_extended, n_ended, n_truncated)
+    return trace, SiblingStats(
+        len(texts) - 1, n_with, n_draws, n_extended, n_ended, n_truncated, n_no_budget
+    )
+
+
+def _remove_shard(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> TraceSet:
@@ -179,7 +187,7 @@ def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> 
                     logger.warning(
                         "invalid shard for %s; re-collecting", problem.problem_id, exc_info=True
                     )
-                    shutil.rmtree(shard)
+                    _remove_shard(shard)
                     cached = None
             if cached is not None:
                 trace = cached[0]
@@ -190,7 +198,7 @@ def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> 
                 try:
                     save_traceset(TraceSet((trace,), {"sibling_stats": asdict(stats)}), temporary)
                     if shard.exists():
-                        shutil.rmtree(shard)
+                        _remove_shard(shard)
                     os.replace(temporary, shard)
                 finally:
                     if temporary.exists():
