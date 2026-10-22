@@ -152,6 +152,32 @@ def test_exhausted_prefix_and_over_cap_draw():
     assert stats.n_ended_thinking == 0
 
 
+def test_extension_counts_prefix_and_accumulated_draw_together():
+    from osc.collect.pipeline import collect_trace_with_stats
+
+    class PieceOvercounter(FakeBackend):
+        def count_tokens(self, text):
+            return {"xx": 4, "yy": 4, "xxyy": 8}.get(text, len(text))
+
+        def continue_steps(self, prompt, thinking_prefix, k, max_tokens):
+            if thinking_prefix == "":
+                return ["z"] * k
+            assert max_tokens == 2
+            return [{"a\n\n": "xx", "a\n\nxx": "yy", "a\n\nxxyy": "!"}[thinking_prefix]] * k
+
+    trace, stats = collect_trace_with_stats(
+        PieceOvercounter(thinking="a\n\nb"),
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, max_thinking_tokens=9, sibling_max_tokens=2, k_siblings=2),
+    )
+    sibling = trace.siblings[1]
+    assert sibling is not None
+    assert sibling.step_tokens.tolist() == [5, 5]
+    assert sibling.features[:, 0].tolist() == [8, 8]
+    assert stats.n_extended == 2
+    assert stats.n_budget_truncated == 0
+
+
 def test_pipeline_import_is_lazy():
     import os
     import subprocess
