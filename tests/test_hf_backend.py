@@ -3,7 +3,8 @@ import pytest
 pytestmark = pytest.mark.model
 
 
-def test_tiny_model_features_and_attention():
+@pytest.fixture
+def tiny_backend():
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
     from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
@@ -11,7 +12,8 @@ def test_tiny_model_features_and_attention():
     tokenizers = pytest.importorskip("tokenizers")
     from osc.collect.hf_backend import HFBackend
 
-    vocabulary = {"[UNK]": 0, "q": 1, "a": 2, "b": 3}
+    torch.manual_seed(0)
+    vocabulary = {"[UNK]": 0, "q": 1, "a": 2, "b": 3, "1": 4, "12": 5, " 3": 6}
     tokenizer = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocabulary, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
     backend = HFBackend.__new__(HFBackend)
@@ -22,7 +24,7 @@ def test_tiny_model_features_and_attention():
     )
     backend.model = LlamaForCausalLM(
         LlamaConfig(
-            vocab_size=4,
+            vocab_size=len(vocabulary),
             hidden_size=16,
             intermediate_size=32,
             num_hidden_layers=2,
@@ -32,12 +34,111 @@ def test_tiny_model_features_and_attention():
         )
     ).eval()
     backend.feature_layers = (-1,)
+    backend.temperature, backend.top_p = 0.6, 0.95
+    return backend
+
+
+def test_tiny_model_features_and_attention(tiny_backend):
+    backend = tiny_backend
     thinking = " a b"
     assert backend.hidden_features("q", thinking, [0, 2, 4]).shape == (3, 16)
     masses = backend.attention_to_span("q", thinking, (1, 2), [0, 2, 4])
     assert masses.shape == (3, 2, 2)
     assert (masses[0] == 0).all()
     assert ((masses >= 0) & (masses <= 1)).all()
+
+
+@pytest.mark.parametrize("non_digit", [False, True])
+def test_score_continuations_matches_manual(tiny_backend, non_digit):
+    import numpy as np
+
+    backend = tiny_backend
+    torch = backend.torch
+    candidates = [" 1", " 12", " a b", ""] * 3
+    context = backend._prompt("q") + "a "
+    expected = []
+    for candidate in candidates:
+        encoded = backend.tokenizer(
+            context + candidate,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+        )
+        offsets = encoded.pop("offset_mapping")[0].tolist()
+        with torch.inference_mode():
+            log_probs = backend.model(**encoded).logits[0].float().log_softmax(-1)
+        score = sum(
+            float(log_probs[i - 1, encoded.input_ids[0, i]])
+            for i, (a, b) in enumerate(offsets)
+            if a >= len(context) and b > a
+        )
+        if non_digit:
+            digit_ids = [4, 5]
+            p_digit = log_probs[-1, digit_ids].exp().sum()
+            score += float(torch.log1p(-p_digit))
+        expected.append(score)
+    actual = backend.score_continuations("q", "a", " ", candidates, non_digit)
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+    assert backend._find_digit_token_ids() == [4, 5]
+    assert backend.score_continuations("q", "", "", []).shape == (0,)
+
+
+def test_score_boundary_and_digit_penalty(tiny_backend):
+    import numpy as np
+
+    from osc.collect.hf_backend import BackendError
+
+    backend = tiny_backend
+    with pytest.raises(BackendError, match="boundary"):
+        backend.score_continuations("q", "a", "", ["b"])
+    plain = backend.score_continuations("q", "", "", [" 1"])
+    penalized = backend.score_continuations("q", "", "", [" 1"], True)
+    encoded = backend.tokenizer(
+        backend._prompt("q") + " 1", return_tensors="pt", add_special_tokens=False
+    )
+    with backend.torch.inference_mode():
+        probs = backend.model(**encoded).logits[0, -1].float().softmax(-1)
+    np.testing.assert_allclose(
+        penalized - plain, [float(backend.torch.log1p(-probs[[4, 5]].sum()))], atol=1e-6
+    )
+
+
+def test_force_answers_one_generate_call(tiny_backend, monkeypatch):
+    backend = tiny_backend
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        ids = kwargs["input_ids"].repeat(kwargs["num_return_sequences"], 1)
+        suffix = backend.torch.full((len(ids), 1), 4, dtype=ids.dtype)
+        return backend.torch.cat([ids, suffix], dim=1)
+
+    monkeypatch.setattr(backend.model, "generate", generate)
+    assert backend.force_answers("q", "a", 3) == ["\\boxed{1"] * 3
+    assert len(calls) == 1
+    assert calls[0]["num_return_sequences"] == 3
+    assert calls[0]["do_sample"] is True
+
+
+def test_force_answers_real_batched_generation(tiny_backend, monkeypatch):
+    backend = tiny_backend
+    generate = backend.model.generate
+    calls = []
+
+    def short_generate(**kwargs):
+        calls.append(kwargs["num_return_sequences"])
+        kwargs["max_new_tokens"] = 2
+        return generate(**kwargs)
+
+    monkeypatch.setattr(backend.model, "generate", short_generate)
+    answers = backend.force_answers("q", "a", 3)
+    assert len(answers) == 3
+    assert all(isinstance(answer, str) and answer.startswith("\\boxed{") for answer in answers)
+    assert calls == [3]
+    backend.temperature = 0
+    assert len(set(backend.force_answers("q", "a", 3))) == 1
+    assert calls == [3, 1]
+    assert backend.force_answers("q", "a", 0) == []
 
 
 def test_attention_version_guard(monkeypatch):

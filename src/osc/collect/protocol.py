@@ -15,6 +15,22 @@ import numpy as np
 
 @runtime_checkable
 class ReasoningBackend(Protocol):
+    def score_continuations(
+        self,
+        prompt: str,
+        thinking_prefix: str,
+        probe: str,
+        candidates: Sequence[str],
+        require_non_digit_next: bool = False,
+    ) -> np.ndarray:
+        """Return summed candidate token log-probabilities, shape (len(candidates),).
+
+        Context is the chat prompt + thinking_prefix + probe inside the think block
+        and must end at a token boundary. If requested, include log P(next token's
+        decoded text does not start with a digit), without stripping whitespace.
+        """
+        ...
+
     def generate_thinking(self, prompt: str, max_tokens: int) -> tuple[str, bool]:
         """Sample a full thinking block. Returns (thinking, natural_stop): natural_stop is
         True when the model closed its thinking itself before ``max_tokens``."""
