@@ -53,16 +53,16 @@ def _number(ans: str) -> float | None:
 def is_equivalent(pred: str | None, gold: str) -> bool:
     if pred is None:
         return False
-    left, right = normalize_answer(pred), normalize_answer(gold)
-    if left == right:
-        return True
 
     def elements(value: str) -> list[str] | None:
-        if "," in value and not re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", value):
+        if "," in value and (
+            re.search(r",\s", value)
+            or not re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", normalize_answer(value))
+        ):
             return value.split(",")
         return None
 
-    xs, ys = elements(left), elements(right)
+    xs, ys = elements(pred), elements(gold)
     if xs is not None or ys is not None:
         return (
             xs is not None
@@ -70,6 +70,9 @@ def is_equivalent(pred: str | None, gold: str) -> bool:
             and len(xs) == len(ys)
             and all(is_equivalent(x, y) for x, y in zip(xs, ys, strict=True))
         )
+    left, right = normalize_answer(pred), normalize_answer(gold)
+    if left == right:
+        return True
     a, b = _number(left), _number(right)
     return a is not None and b is not None and math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-12)
 

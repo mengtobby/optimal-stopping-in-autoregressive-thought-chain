@@ -88,7 +88,8 @@ def test_budget_and_stride():
     assert stats.n_budget_truncated == 4
 
 
-def test_corrupt_shard_and_atomic_write(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("stray_file", [False, True])
+def test_corrupt_shard_and_atomic_write(tmp_path, monkeypatch, caplog, stray_file):
     import osc.collect.pipeline as pipeline
 
     problem = Problem("a", "q", "1", "test")
@@ -104,11 +105,51 @@ def test_corrupt_shard_and_atomic_write(tmp_path, monkeypatch, caplog):
 
     monkeypatch.setattr(pipeline.os, "replace", replace)
     first = collect_dataset(FakeBackend(), [problem], config, tmp_path)
-    (replacements[0] / "arrays.npz").write_bytes(b"corrupt")
+    if stray_file:
+        import shutil
+
+        shutil.rmtree(replacements[0])
+        replacements[0].write_text("stray", encoding="utf-8")
+    else:
+        (replacements[0] / "arrays.npz").write_bytes(b"corrupt")
     resumed = collect_dataset(FakeBackend(), [problem], config, tmp_path)
     assert len(replacements) == 2
     assert "invalid shard" in caplog.text
     assert resumed.metadata["sibling_stats"] == first.metadata["sibling_stats"]
+
+
+def test_budget_uses_whole_prefix(tmp_path):
+    class PieceOvercounter(FakeBackend):
+        def count_tokens(self, text):
+            return {"": 0, "a\n\n": 4, "b\n\n": 4, "a\n\nb\n\n": 4}.get(text, len(text))
+
+    result = collect_dataset(
+        PieceOvercounter(thinking="a\n\nb\n\nc", continuations=("x",)),
+        [Problem("a", "q", "1", "test")],
+        CollectConfig(min_chars=0, max_thinking_tokens=7, k_siblings=2),
+        tmp_path,
+    )
+    assert result[0].siblings[2] is not None
+    assert result.metadata["sibling_stats"]["n_with_siblings"] == 3
+
+
+def test_exhausted_prefix_and_over_cap_draw():
+    from osc.collect.pipeline import collect_trace_with_stats
+
+    class Overcounter(FakeBackend):
+        def count_tokens(self, text):
+            return 2 * len(text)
+
+    trace, stats = collect_trace_with_stats(
+        Overcounter(thinking="a\n\nb", continuations=("xxxx",)),
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, max_thinking_tokens=4, sibling_max_tokens=2, k_siblings=2),
+    )
+    assert trace.siblings[0].step_tokens.tolist() == [4, 4]
+    assert trace.siblings[1] is None
+    assert stats.n_no_budget == 1
+    assert stats.n_budget_truncated == 2
+    assert stats.n_ended_thinking == 0
 
 
 def test_pipeline_import_is_lazy():
