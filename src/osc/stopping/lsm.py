@@ -1,4 +1,4 @@
-"""Longstaff--Schwartz stopping with trace-level cross-fitting."""
+"""Longstaff--Schwartz stopping with problem-grouped cross-fitting."""
 
 from __future__ import annotations
 
@@ -160,11 +160,13 @@ def cross_fit_lsm(
     panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG, n_folds: int = 5, seed: int = 0
 ) -> tuple[np.ndarray, tuple[LSMPolicy, ...], np.ndarray]:
     """Return held-out stop times, fold policies, and each trace's fold index."""
-    if not isinstance(n_folds, int) or not 2 <= n_folds <= panel.n_traces:
-        raise LSMError("n_folds must be an integer between 2 and the number of traces")
-    folds = np.empty(panel.n_traces, dtype=np.int64)
-    permutation = np.random.default_rng(seed).permutation(panel.n_traces)
-    folds[permutation] = np.arange(panel.n_traces) % n_folds
+    problem_ids = [trace.problem_id for trace in panel.traces]
+    unique_ids = list(dict.fromkeys(problem_ids))
+    if not isinstance(n_folds, int) or not 2 <= n_folds <= len(unique_ids):
+        raise LSMError("n_folds must be an integer between 2 and the number of problems")
+    permutation = np.random.default_rng(seed).permutation(len(unique_ids))
+    assignments = {unique_ids[index]: rank % n_folds for rank, index in enumerate(permutation)}
+    folds = np.array([assignments[problem_id] for problem_id in problem_ids], dtype=np.int64)
     taus = np.empty(panel.n_traces, dtype=np.int64)
     policies = []
     for fold in range(n_folds):

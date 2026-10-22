@@ -143,3 +143,20 @@ def test_seeded_folds():
     second = cross_fit_lsm(panel, seed=12)
     np.testing.assert_array_equal(first[0], second[0])
     np.testing.assert_array_equal(first[2], second[2])
+
+
+def test_problem_grouped_folds_and_unique_id_compatibility():
+    panel, _ = toy(60)
+    _, _, folds = cross_fit_lsm(panel, seed=17)
+    expected = np.empty(60, dtype=int)
+    expected[np.random.default_rng(17).permutation(60)] = np.arange(60) % 5
+    np.testing.assert_array_equal(folds, expected)
+    grouped = TraceSet(
+        tuple(replace(t, problem_id=str(i // 3)) for i, t in enumerate(panel.traces))
+    )
+    panel = build_panel(grouped, panel.lam, panel.token_scale)
+    _, _, folds = cross_fit_lsm(panel, seed=17)
+    for i in range(20):
+        assert len(set(folds[3 * i : 3 * i + 3])) == 1
+    with pytest.raises(ValueError, match="number of problems"):
+        cross_fit_lsm(panel, n_folds=21)

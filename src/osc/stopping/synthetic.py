@@ -67,6 +67,57 @@ def default_model() -> MarkovReasoningModel:
     )
 
 
+def overthinking_model(feature_noise: float = 0.0) -> MarkovReasoningModel:
+    """Random discovery followed by correction, doubt, and destructive overthinking.
+
+    States are explore, correct candidate, wrong candidate, doubt, and loop.
+    """
+    return MarkovReasoningModel(
+        transition=np.array(
+            [
+                [0.72, 0.16, 0.08, 0.03, 0.01],
+                [0.00, 0.55, 0.25, 0.15, 0.05],
+                [0.05, 0.25, 0.50, 0.15, 0.05],
+                [0.20, 0.15, 0.20, 0.35, 0.10],
+                [0.00, 0.01, 0.01, 0.03, 0.95],
+            ]
+        ),
+        accuracy=np.array([0.10, 0.98, 0.12, 0.08, 0.01]),
+        stop_prob=np.array([0.005, 0.04, 0.03, 0.03, 0.65]),
+        initial=np.array([1, 0, 0, 0, 0]),
+        tokens_per_step=150,
+        t_max=24,
+        feature_noise=feature_noise,
+    )
+
+
+def exact_optimal_stop_times(
+    model: MarkovReasoningModel,
+    lam: float,
+    traces: TraceSet,
+    token_scale: float = 1000.0,
+) -> np.ndarray:
+    """Apply the fully observed DP rule to zero-noise model paths."""
+    if model.feature_noise != 0:
+        raise SyntheticError("exact stop times require feature_noise == 0")
+    values = exact_value_function(model, lam, token_scale)
+    times = np.empty(len(traces), dtype=np.int64)
+    for i, trace in enumerate(traces):
+        if trace.n_steps > model.t_max or trace.features.shape[1] != len(model.accuracy):
+            raise SyntheticError("trace dimensions must match the model")
+        states = trace.features.argmax(axis=1)
+        if not np.allclose(trace.features, np.eye(len(model.accuracy))[states]):
+            raise SyntheticError("exact stop times require one-hot state features")
+        times[i] = trace.n_steps - 1
+        for t in range(trace.n_steps - 1):
+            state = states[t]
+            payoff = model.accuracy[state] - lam * model.tokens_per_step * t / token_scale
+            if payoff >= model.transition[state] @ values[t + 1]:
+                times[i] = t
+                break
+    return times
+
+
 def sample_traceset(
     model: MarkovReasoningModel, n: int, k_siblings: int, seed: int, sibling_stride: int = 1
 ) -> TraceSet:
