@@ -10,6 +10,7 @@ from pathlib import Path
 
 from osc.analysis.headroom import headroom_report, report_to_json, report_to_markdown
 from osc.data.io import load_traceset
+from osc.stopping.pathwise import PathwiseConfig
 from osc.stopping.synthetic import (
     default_model,
     exact_optimal_stop_times,
@@ -30,9 +31,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", choices=("default", "overthinking"), default="default")
     parser.add_argument("--feature-noise", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--time-bins", type=int, default=4)
+    parser.add_argument("--pathwise-components", type=int, default=8)
     parser.add_argument("--lam", type=float, nargs="+", required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    pathwise_config = PathwiseConfig(
+        n_components=args.pathwise_components, n_time_bins=args.time_bins
+    )
     logging.basicConfig(level=logging.INFO)
     model = None
     if args.synthetic is not None:
@@ -53,7 +59,13 @@ def main(argv: list[str] | None = None) -> int:
             if model is not None and model.feature_noise == 0
             else None
         )
-        report = headroom_report(traces, lam, seed=args.seed, exact_stop_times=exact_times)
+        report = headroom_report(
+            traces,
+            lam,
+            seed=args.seed,
+            exact_stop_times=exact_times,
+            pathwise_config=pathwise_config,
+        )
         data = report_to_json(report)
         markdown = report_to_markdown(report)
         if model is not None:

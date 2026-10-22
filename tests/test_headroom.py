@@ -14,10 +14,12 @@ from osc.analysis.headroom import (
     report_to_json,
     report_to_markdown,
 )
+from osc.stopping.pathwise import PathwiseConfig, cross_fit_pathwise_dual
 from osc.stopping.synthetic import (
     default_model,
     exact_optimal_stop_times,
     exact_value,
+    overthinking_model,
     sample_traceset,
 )
 
@@ -43,6 +45,8 @@ def test_no_siblings_and_validation():
     assert np.isnan(report.headroom_paired)
     assert report_to_json(report)["headroom_paired_ci"] == [None, None]
     assert np.isnan(report.dual_upper)
+    assert np.isnan(report.dual_lsm_upper)
+    assert report_to_json(report)["dual_lsm_upper_se"] is None
     assert any("No traces have siblings" in note for note in report.notes)
     assert all(row.family != "bound" for row in report.rows)
     assert report_to_json(report)["dual_upper"] is None
@@ -75,6 +79,10 @@ def test_cli(tmp_path):
                     noise,
                     "--lam",
                     "0.05",
+                    "--time-bins",
+                    "2",
+                    "--pathwise-components",
+                    "0",
                     "--out",
                     str(tmp_path),
                 ]
@@ -119,6 +127,21 @@ def test_paired_headroom_and_exact_row():
         assert np.all(
             differences[indices] >= -martingale[np.arange(len(indices)), times[indices]] - 1e-12
         )
+    assert report.dual_lsm_upper == pytest.approx(dual_values.mean())
+    assert report.dual_lsm_upper_se == cluster_standard_error(dual_values, clusters)
+    lsm_row = next(row for row in report.rows if row.method == "dual-upper-cross-fit")
+    assert lsm_row.value_ci == cluster_bootstrap_mean_ci(dual_values, clusters, seed=8)
+    anchors = [
+        [
+            ("lsm_value", policy.value),
+            ("lsm_payoff", policy.payoff_estimate),
+            ("lsm_continuation", policy.continuation),
+        ]
+        for policy in policies
+    ]
+    result, _ = cross_fit_pathwise_dual(panel, folds, anchors)
+    dual_values = result.per_trace
+    differences = dual_values - panel.payoff[np.arange(len(traces)), times]
     assert report.headroom_paired == pytest.approx(differences.mean())
     assert report.headroom_paired == pytest.approx(report.dual_upper - report.lsm_lower)
     assert report.headroom_paired_ci == cluster_bootstrap_mean_ci(differences, clusters, seed=8)
@@ -135,3 +158,27 @@ def test_paired_headroom_and_exact_row():
     assert data["headroom_paired"] == report.headroom_paired
     assert data["headroom_paired_ci"] == list(report.headroom_paired_ci)
     assert "Paired headroom:" in report_to_markdown(report)
+
+
+def test_noisy_pathwise_headline():
+    traces = sample_traceset(overthinking_model(feature_noise=0.6), 2000, 8, 0)
+    report = headroom_report(traces, 0.05, pathwise_config=PathwiseConfig())
+    se = report.dual_upper_se
+    assert report.dual_upper <= report.hindsight_value + 2 * se
+    assert report.dual_upper <= report.dual_lsm_upper + 2 * se
+    assert report.dual_upper >= report.lsm_lower - 3 * se
+    assert report.irreducible_gap >= -2 * se
+    assert report.irreducible_gap == report.hindsight_value - report.dual_upper
+    data = report_to_json(report)
+    markdown = report_to_markdown(report)
+    for method, value in (
+        ("dual-upper-cross-fit", report.dual_lsm_upper),
+        ("dual-pathwise-cross-fit", report.dual_upper),
+    ):
+        row = next(row for row in data["rows"] if row["method"] == method)
+        assert row["family"] == "bound"
+        assert row["value"] == value
+        assert method in markdown
+    assert data["dual_lsm_upper"] == report.dual_lsm_upper
+    assert "Pathwise dual upper:" in markdown
+    assert "LSM dual upper:" in markdown
