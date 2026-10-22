@@ -32,7 +32,10 @@ def normalize_answer(ans: str) -> str:
 
 
 def _number(ans: str) -> float | None:
-    ans = ans.replace(",", "")
+    if "," in ans:
+        if not re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", ans):
+            return None
+        ans = ans.replace(",", "")
     fraction = re.fullmatch(r"([+-]?)\\frac\{([^{}]+)\}\{([^{}]+)\}", ans)
     if fraction:
         ans = fraction[1] + fraction[2] + "/" + fraction[3]
@@ -53,6 +56,20 @@ def is_equivalent(pred: str | None, gold: str) -> bool:
     left, right = normalize_answer(pred), normalize_answer(gold)
     if left == right:
         return True
+
+    def elements(value: str) -> list[str] | None:
+        if "," in value and not re.fullmatch(r"[+-]?\d{1,3}(,\d{3})+(\.\d+)?", value):
+            return value.split(",")
+        return None
+
+    xs, ys = elements(left), elements(right)
+    if xs is not None or ys is not None:
+        return (
+            xs is not None
+            and ys is not None
+            and len(xs) == len(ys)
+            and all(is_equivalent(x, y) for x, y in zip(xs, ys, strict=True))
+        )
     a, b = _number(left), _number(right)
     return a is not None and b is not None and math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-12)
 
