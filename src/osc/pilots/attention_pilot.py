@@ -1,7 +1,7 @@
 """Attention to earlier answers, matched by distance from the answer anchor."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -64,6 +64,7 @@ class AttentionPilotResult:
     perm_p: float
     n_flip: int
     n_control: int
+    n_skipped: int = 0
 
 
 def compare_flip_vs_control(
@@ -123,7 +124,11 @@ def run_attention_pilot(
     if max_after < 1:
         raise AttentionError("max_after must be positive")
     flips, controls, offsets = [], [], []
+    n_skipped = 0
     for event in find_anchor_events(traces):
+        if not event.span_found or event.span[0] >= event.span[1]:
+            n_skipped += 1
+            continue
         trace = traces[event.trace_index]
         if trace.problem_id not in prompts:
             raise AttentionError(f"missing prompt for {trace.problem_id!r}")
@@ -137,6 +142,7 @@ def run_attention_pilot(
         else:
             flips.append(curve)
             offsets.append(event.flip_step - event.anchor_step - 1)
-    return compare_flip_vs_control(
+    result = compare_flip_vs_control(
         np.array(flips).reshape(-1, max_after), np.array(controls).reshape(-1, max_after), offsets
     )
+    return replace(result, n_skipped=n_skipped)

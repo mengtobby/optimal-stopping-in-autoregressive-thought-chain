@@ -32,9 +32,13 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--every", type=int, default=1)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--include-censored", action="store_true")
     args = parser.parse_args()
     if args.every < 1:
         parser.error("--every must be positive")
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max-steps must be positive")
     prompts = {}
     with args.problems.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -54,7 +58,14 @@ def main() -> None:
     from osc.collect.hf_backend import HFBackend
 
     backend = HFBackend(args.model)
-    result = run_elicitation_pilot(backend, traces, prompts, every=args.every)
+    result = run_elicitation_pilot(
+        backend,
+        traces,
+        prompts,
+        every=args.every,
+        include_censored=args.include_censored,
+        max_steps=args.max_steps,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
         json.dumps(_json_value(asdict(result)), indent=2, allow_nan=False), encoding="utf-8"
