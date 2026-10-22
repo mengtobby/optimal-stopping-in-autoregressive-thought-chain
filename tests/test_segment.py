@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from osc.collect.segment import SegmentationError, first_step, segment_thinking
@@ -5,8 +7,24 @@ from osc.collect.segment import SegmentationError, first_step, segment_thinking
 
 @pytest.mark.parametrize("mode", ["paragraph", "marker"])
 @pytest.mark.parametrize("minimum", [0, 4, 40])
-def test_causal_spans(mode, minimum):
+@pytest.mark.parametrize("seed", range(24))
+def test_causal_spans(mode, minimum, seed):
     text = "Start here.\n\nWait, more.\n\nplain.\n\nActually yes.\n\nEnd."
+    rng = random.Random(seed)
+    text += "\n\n" + "\n\n".join(
+        rng.choice(
+            [
+                "Wait, yes.",
+                "Actually no.",
+                "Hmm",
+                "x",
+                "plain paragraph " * 5,
+                "Alternatively try again.",
+                "Let me check.",
+            ]
+        )
+        for _ in range(rng.randint(2, 20))
+    )
     spans = segment_thinking(text, mode, minimum, None)
     assert "".join(text[a:b] for a, b in spans) == text
     assert all(b == c for (_, b), (c, _) in zip(spans, spans[1:], strict=False))

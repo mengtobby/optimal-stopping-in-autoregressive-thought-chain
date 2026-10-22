@@ -13,8 +13,8 @@ def test_trace():
     assert "".join(trace.step_texts) == backend.thinking
     assert trace.step_texts[0] == "" and trace.step_tokens[0] == 0
     assert trace.forced_correct.tolist() == [1] * trace.n_steps
-    assert all(s is None for s in trace.siblings[-2:])
-    assert backend.hidden_features_calls == 1 + 2 * (trace.n_steps - 2)
+    assert trace.siblings[-2] is not None and trace.siblings[-1] is None
+    assert backend.hidden_features_calls == 1 + 2 * (trace.n_steps - 1)
     backend = FakeBackend()
     collect_trace(backend, Problem("a", "q", "1", "test"), CollectConfig(k_siblings=0))
     assert backend.hidden_features_calls == 1
@@ -39,3 +39,126 @@ def test_resume_failure(tmp_path):
 def test_config(kwargs):
     with pytest.raises(ValueError):
         CollectConfig(**kwargs)
+
+
+def test_merged_final_has_no_siblings():
+    trace = collect_trace(
+        FakeBackend(),
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, max_steps=2, k_siblings=2),
+    )
+    assert trace.siblings[0] is not None
+    assert trace.siblings[-2] is None
+
+
+def test_extension_and_ended_thinking():
+    from osc.collect.pipeline import collect_trace_with_stats
+
+    class Scripted(FakeBackend):
+        def continue_steps(self, prompt, thinking_prefix, k, max_tokens):
+            if k == 2:
+                assert max_tokens == 4
+                return ["abcd", "x"]
+            assert thinking_prefix == "abcd"
+            return ["\n\nzz"]
+
+    trace, stats = collect_trace_with_stats(
+        Scripted(thinking="last"),
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, k_siblings=2, sibling_max_tokens=4),
+    )
+    assert trace.siblings[0].step_tokens.tolist() == [6, 1]
+    assert stats.n_extended == 1
+    assert stats.n_ended_thinking == 1
+    assert stats.n_draws == 2
+
+
+def test_budget_and_stride():
+    from osc.collect.pipeline import collect_trace_with_stats
+
+    trace, stats = collect_trace_with_stats(
+        FakeBackend(thinking="a\n\nb", continuations=("xxxxxxxxxx",)),
+        Problem("a", "q", "1", "test"),
+        CollectConfig(
+            min_chars=0, max_thinking_tokens=5, sibling_max_tokens=3, k_siblings=2, sibling_stride=1
+        ),
+    )
+    assert trace.siblings[0].step_tokens.tolist() == [5, 5]
+    assert trace.siblings[1].step_tokens.tolist() == [2, 2]
+    assert stats.n_budget_truncated == 4
+
+
+def test_corrupt_shard_and_atomic_write(tmp_path, monkeypatch, caplog):
+    import osc.collect.pipeline as pipeline
+
+    problem = Problem("a", "q", "1", "test")
+    config = CollectConfig(k_siblings=0)
+    replacements = []
+    original = pipeline.os.replace
+
+    def replace(source, destination):
+        assert source.parent == destination.parent
+        assert (source / "metadata.json").exists()
+        replacements.append(destination)
+        original(source, destination)
+
+    monkeypatch.setattr(pipeline.os, "replace", replace)
+    first = collect_dataset(FakeBackend(), [problem], config, tmp_path)
+    (replacements[0] / "arrays.npz").write_bytes(b"corrupt")
+    resumed = collect_dataset(FakeBackend(), [problem], config, tmp_path)
+    assert len(replacements) == 2
+    assert "invalid shard" in caplog.text
+    assert resumed.metadata["sibling_stats"] == first.metadata["sibling_stats"]
+
+
+def test_pipeline_import_is_lazy():
+    import os
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import osc.collect.pipeline; "
+            "assert 'torch' not in sys.modules; assert 'transformers' not in sys.modules",
+        ],
+        env={**os.environ, "PYTHONPATH": "src"},
+        check=True,
+    )
+
+
+@pytest.mark.parametrize("extend", [False, True])
+def test_ended_thinking_uses_outer_step_boundary(extend):
+    from osc.collect.pipeline import collect_trace_with_stats
+    from osc.collect.segment import first_step
+
+    text = "AAAA\n\nB" if extend else "A\n\nB"
+    cap = 4 if extend else 8
+
+    class Scripted(FakeBackend):
+        def continue_steps(self, prompt, thinking_prefix, k, max_tokens):
+            if extend:
+                return [text[len(thinking_prefix) :][:max_tokens]] * k
+            return [text] * k
+
+    backend = Scripted(
+        thinking=text,
+        answers={
+            "": [r"\boxed{0}"],
+            first_step(text, min_chars=0): [r"\boxed{1}"],
+            text: [r"\boxed{0}"],
+        },
+    )
+    trace, stats = collect_trace_with_stats(
+        backend,
+        Problem("a", "q", "1", "test"),
+        CollectConfig(min_chars=0, k_siblings=2, sibling_max_tokens=cap, sibling_stride=2),
+    )
+    sibling = trace.siblings[0]
+    assert trace.step_texts[1] == first_step(text, min_chars=0)
+    assert sibling.step_tokens.tolist() == [int(trace.step_tokens[1])] * 2
+    assert sibling.forced_correct.tolist() == [1.0, 1.0]
+    assert (sibling.features == trace.features[1]).all()
+    assert stats.n_ended_thinking == 2
+    assert stats.n_extended == (2 if extend else 0)

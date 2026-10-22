@@ -125,7 +125,10 @@ class HFBackend:
     ) -> np.ndarray:
         # Intercept eager softmax inputs: only selected rows are materialized for the
         # probe, while SDPA computes the full forward output without an attention matrix.
-        from transformers import AttentionInterface
+        try:
+            from transformers import AttentionInterface
+        except ImportError as exc:
+            raise BackendError("attention_to_span requires transformers>=4.51") from exc
 
         if not 0 <= span[0] <= span[1] <= len(thinking):
             raise BackendError("span must lie within thinking")

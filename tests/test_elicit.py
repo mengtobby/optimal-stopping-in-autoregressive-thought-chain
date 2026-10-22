@@ -90,3 +90,42 @@ def test_calibrated_and_receding_plans():
 def test_invalid_stats(planned, horizons, tolerance):
     with pytest.raises(ElicitationError):
         consistency_stats(planned, horizons, tolerance)
+
+
+def test_censored_exclusions_and_override():
+    from dataclasses import replace
+
+    from osc.pilots.elicit import ConsistencyStats
+
+    natural = make_trace((0, 1, 1))
+    censored = replace(natural, natural_stop=False)
+    capped = make_trace()
+    traces = TraceSet((natural, censored, capped))
+    backend = Backend()
+    stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=4)
+    assert (stats.n_traces, stats.n_excluded) == (1, 2)
+    assert len(backend.prefixes) == 3
+    included = run_elicitation_pilot(
+        Backend(), traces, {"p": "prompt"}, max_steps=4, include_censored=True
+    )
+    assert (included.n_traces, included.n_excluded) == (3, 0)
+    excluded = run_elicitation_pilot(Backend(), TraceSet((censored,)), {})
+    assert (excluded.n_traces, excluded.n_excluded, excluded.n_elicitations) == (0, 1, 0)
+    assert np.isnan(excluded.parse_rate)
+    stats = consistency_stats([[2, 1, 0], [0, 0, 0]], [3, 3], censored=[False, True])
+    assert stats.mean_bias == 0
+    assert stats.n_excluded == 1
+    assert stats.per_trace_slopes.shape == (1,)
+    assert ConsistencyStats(0, 0, 0, 0, 0, 0, 0, 0, np.empty(0)).n_excluded == 0
+
+
+@pytest.mark.parametrize("mask", [[True, False], [1], [[True]]])
+def test_invalid_censor_mask(mask):
+    with pytest.raises(ElicitationError, match="censored"):
+        consistency_stats([[0]], [1], censored=mask)
+
+
+@pytest.mark.parametrize("max_steps", [0, -1, 1.5, True])
+def test_invalid_max_steps(max_steps):
+    with pytest.raises(ElicitationError, match="max_steps"):
+        run_elicitation_pilot(Backend(), TraceSet((make_trace(),)), {}, max_steps=max_steps)

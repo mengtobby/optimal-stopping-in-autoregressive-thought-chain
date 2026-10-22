@@ -97,7 +97,10 @@ def test_invalid_backend_and_curves():
 
 
 @pytest.mark.parametrize("script", ["pilot_flips.py", "pilot_elicit.py"])
-def test_cli_without_torch(script, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "censor_args", [[], ["--max-steps", "4"], ["--max-steps", "4", "--include-censored"]]
+)
+def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
@@ -138,13 +141,36 @@ def test_cli_without_torch(script, tmp_path, monkeypatch):
             "fake-model",
             "--out",
             str(output),
-        ],
+        ]
+        + (censor_args if script == "pilot_elicit.py" else []),
     )
     namespace["main"]()
     result = json.loads(output.read_text())
     if script == "pilot_flips.py":
         assert result["n_flip"] == 1
         assert result["auroc"] is None
+        assert result["n_skipped"] == 0
     else:
-        assert result["n_traces"] == 1
-        assert result["parse_rate"] == 1
+        excluded = censor_args == ["--max-steps", "4"]
+        assert result["n_traces"] == (0 if excluded else 1)
+        assert result["n_excluded"] == int(excluded)
+        assert result["parse_rate"] == (None if excluded else 1)
+
+
+def test_runner_skips_missing_and_empty_spans(monkeypatch):
+    from osc.pilots.attention_pilot import AttentionPilotResult
+    from osc.pilots.flips import AnchorEvent
+
+    class NoAttention:
+        def attention_to_span(self, *args):
+            raise AssertionError("ineligible events must not query attention")
+
+    traces = TraceSet((make_trace((1, 1), answers=("99", "99")),))
+    result = run_attention_pilot(NoAttention(), traces, {})
+    assert (result.n_skipped, result.n_flip, result.n_control) == (1, 0, 0)
+    monkeypatch.setattr(
+        "osc.pilots.attention_pilot.find_anchor_events",
+        lambda traces: (AnchorEvent("p", 0, 0, "42", (0, 0), None, False),),
+    )
+    assert run_attention_pilot(NoAttention(), traces, {}).n_skipped == 1
+    assert AttentionPilotResult(np.empty((0, 1)), np.empty((0, 1)), 0, 0, 0, 0).n_skipped == 0

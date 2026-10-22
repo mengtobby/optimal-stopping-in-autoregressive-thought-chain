@@ -64,17 +64,20 @@ class ConsistencyStats:
     receding_slope_se: float
     reversal_rate: float
     per_trace_slopes: np.ndarray
+    n_excluded: int = 0
 
 
 def consistency_stats(
     planned: np.ndarray,
     horizons: Sequence[int],
     tolerance: float = 1,
+    censored: Sequence[bool] | None = None,
 ) -> ConsistencyStats:
     """Analyze NaN-padded plans; parse_rate counts all in-horizon slots.
 
     Skipped and unparseable probes are indistinguishable in the public array format.
     The slope SE is the usual homoskedastic OLS SE with trace intercepts removed.
+    Censored rows are excluded from all statistics, including per_trace_slopes.
     """
     values = np.asarray(planned, float)
     h = np.asarray(horizons)
@@ -89,6 +92,11 @@ def consistency_stats(
     alive = np.arange(values.shape[1])[None, :] < h[:, None]
     if np.any(np.isinf(values)) or np.any((values[alive] < 0) | (values[alive] > 10000)):
         raise ElicitationError("plans must be NaN or finite values in [0, 10000]")
+    excluded = np.zeros(len(values), dtype=bool) if censored is None else np.asarray(censored)
+    if excluded.shape != (len(values),) or excluded.dtype.kind != "b":
+        raise ElicitationError("censored must contain one boolean per trace")
+    n_excluded = int(excluded.sum())
+    values, h, alive = values[~excluded], h[~excluded], alive[~excluded]
     valid = alive & np.isfinite(values)
     rows, times = np.nonzero(valid)
     observed = values[valid]
@@ -128,6 +136,7 @@ def consistency_stats(
         se,
         float(np.mean(observed + tolerance < realized)) if observed.size else float("nan"),
         slopes,
+        n_excluded,
     )
 
 
@@ -136,14 +145,28 @@ def run_elicitation_pilot(
     traces: TraceSet,
     prompts: Mapping[str, str],
     every: int = 1,
+    include_censored: bool = False,
+    max_steps: int | None = None,
 ) -> ConsistencyStats:
+    """Probe completed traces; optionally include traces censored by collection limits."""
     if every < 1:
         raise ElicitationError("every must be positive")
+    if max_steps is not None and (
+        isinstance(max_steps, bool) or not isinstance(max_steps, (int, np.integer)) or max_steps < 1
+    ):
+        raise ElicitationError("max_steps must be a positive integer")
+    censored = [
+        not include_censored
+        and (not trace.natural_stop or (max_steps is not None and trace.n_steps >= max_steps))
+        for trace in traces
+    ]
     planned = np.full((len(traces), traces.max_steps), np.nan)
     for i, trace in enumerate(traces):
+        if censored[i]:
+            continue
         if trace.problem_id not in prompts:
             raise ElicitationError(f"missing prompt for {trace.problem_id!r}")
         planned[i, : trace.n_steps] = elicit_remaining(
             backend, prompts[trace.problem_id], trace, every
         )
-    return consistency_stats(planned, [trace.n_steps for trace in traces])
+    return consistency_stats(planned, [trace.n_steps for trace in traces], censored=censored)

@@ -35,3 +35,19 @@ def test_grading():
         "1/2",
         0.5,
     )
+
+
+@pytest.mark.parametrize(
+    "left,right,expected",
+    [
+        ("1, 2", "12", False),
+        ("1,234", "1234", True),
+        ("1,2", "1, 2", True),
+        ("1,2", "2,1", False),
+        ("1,2.0", "1.0,2", True),
+        ("12,34", "1234", False),
+        ("-1,234.5", "-1234.5", True),
+    ],
+)
+def test_comma_answers(left, right, expected):
+    assert is_equivalent(left, right) is expected
