@@ -98,7 +98,7 @@ def test_invalid_backend_and_curves():
 
 @pytest.mark.parametrize("script", ["pilot_flips.py", "pilot_elicit.py"])
 @pytest.mark.parametrize(
-    "censor_args", [[], ["--max-steps", "4"], ["--max-steps", "4", "--include-censored"]]
+    "censor_args", [[], ["--max-steps", "3"], ["--max-steps", "3", "--include-censored"]]
 )
 def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
     original_import = builtins.__import__
@@ -151,7 +151,7 @@ def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
         assert result["auroc"] is None
         assert result["n_skipped"] == 0
     else:
-        excluded = censor_args == ["--max-steps", "4"]
+        excluded = censor_args == ["--max-steps", "3"]
         assert result["n_traces"] == (0 if excluded else 1)
         assert result["n_excluded"] == int(excluded)
         assert result["parse_rate"] == (None if excluded else 1)

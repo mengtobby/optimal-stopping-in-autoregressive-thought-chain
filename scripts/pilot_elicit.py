@@ -32,7 +32,11 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--every", type=int, default=1)
-    parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="collection CollectConfig.max_steps (defaults to trace metadata)",
+    )
     parser.add_argument("--include-censored", action="store_true")
     args = parser.parse_args()
     if args.every < 1:

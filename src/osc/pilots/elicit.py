@@ -148,16 +148,26 @@ def run_elicitation_pilot(
     include_censored: bool = False,
     max_steps: int | None = None,
 ) -> ConsistencyStats:
-    """Probe completed traces; optionally include traces censored by collection limits."""
+    """Probe completed traces; optionally include traces censored by collection limits.
+
+    max_steps is CollectConfig.max_steps, defaulting to collect_config in metadata.
+    The empty prefix counts as a step: M steps are kept, M + 1 steps are censored.
+    Traces without a natural stop are also censored.
+    """
     if every < 1:
         raise ElicitationError("every must be positive")
+    if max_steps is None:
+        collect_config = traces.metadata.get("collect_config", {})
+        if not isinstance(collect_config, Mapping):
+            raise ElicitationError("metadata collect_config must be a mapping")
+        max_steps = collect_config.get("max_steps")
     if max_steps is not None and (
         isinstance(max_steps, bool) or not isinstance(max_steps, (int, np.integer)) or max_steps < 1
     ):
         raise ElicitationError("max_steps must be a positive integer")
     censored = [
         not include_censored
-        and (not trace.natural_stop or (max_steps is not None and trace.n_steps >= max_steps))
+        and (not trace.natural_stop or (max_steps is not None and trace.n_steps > max_steps))
         for trace in traces
     ]
     planned = np.full((len(traces), traces.max_steps), np.nan)
