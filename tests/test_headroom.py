@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -87,19 +88,29 @@ def test_cli(tmp_path):
 def test_paired_headroom_and_exact_row():
     from osc.stopping.dual import dual_upper_bound, martingale_increments
     from osc.stopping.lsm import cross_fit_lsm
-    from osc.stopping.payoff import bootstrap_mean_ci, build_panel
+    from osc.stopping.payoff import build_panel
+    from osc.stopping.stats import cluster_bootstrap_mean_ci, cluster_standard_error
 
     model = default_model()
     traces = sample_traceset(model, 300, 8, 8)
+    traces = replace(
+        traces,
+        traces=tuple(
+            replace(trace, problem_id=f"problem-{i // 3}") for i, trace in enumerate(traces)
+        ),
+    )
+    clusters = [trace.problem_id for trace in traces]
     exact_times = exact_optimal_stop_times(model, 0.05, traces)
     report = headroom_report(traces, 0.05, seed=8, exact_stop_times=exact_times)
     panel = build_panel(traces, 0.05)
     times, policies, folds = cross_fit_lsm(panel, seed=8)
     differences = np.empty(len(traces))
+    dual_values = np.empty(len(traces))
     for fold, policy in enumerate(policies):
         indices = np.flatnonzero(folds == fold)
         held = panel.subset(indices)
         dual = dual_upper_bound(held, policy.value)
+        dual_values[indices] = dual.per_trace
         differences[indices] = dual.per_trace - held.payoff[np.arange(len(indices)), times[indices]]
         increments = martingale_increments(held, policy.value)
         martingale = np.column_stack(
@@ -110,8 +121,14 @@ def test_paired_headroom_and_exact_row():
         )
     assert report.headroom_paired == pytest.approx(differences.mean())
     assert report.headroom_paired == pytest.approx(report.dual_upper - report.lsm_lower)
-    assert report.headroom_paired_ci == bootstrap_mean_ci(differences, seed=8)
+    assert report.headroom_paired_ci == cluster_bootstrap_mean_ci(differences, clusters, seed=8)
+    assert report.dual_upper_se == cluster_standard_error(dual_values, clusters)
+    assert report.rows[-1].value_ci == cluster_bootstrap_mean_ci(dual_values, clusters, seed=8)
+    assert any("clustered by problem" in note for note in report.notes)
     oracle = next(row for row in report.rows if row.method == "exact-optimal")
+    assert oracle.value_ci == cluster_bootstrap_mean_ci(
+        panel.payoff[np.arange(len(traces)), exact_times], clusters, seed=8
+    )
     assert oracle.family == "oracle"
     assert oracle.value == pytest.approx(panel.payoff[np.arange(len(traces)), exact_times].mean())
     data = report_to_json(report)

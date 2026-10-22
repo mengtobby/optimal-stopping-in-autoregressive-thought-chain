@@ -18,7 +18,7 @@ from osc.stopping.baselines import (
 )
 from osc.stopping.dual import dual_upper_bound
 from osc.stopping.lsm import LSMConfig, cross_fit_lsm
-from osc.stopping.payoff import bootstrap_mean_ci, build_panel, evaluate_stop_times
+from osc.stopping.payoff import build_panel, evaluate_stop_times
 from osc.stopping.prophet import (
     hindsight_prophet,
     independent_dp_thresholds,
@@ -27,6 +27,7 @@ from osc.stopping.prophet import (
     threshold_stop_times,
     time_threshold_stop_times,
 )
+from osc.stopping.stats import cluster_bootstrap_mean_ci, cluster_standard_error
 
 
 class HeadroomError(ValueError):
@@ -87,6 +88,7 @@ def headroom_report(
         isinstance(k, bool) or not isinstance(k, int) or k < 1 for k in convergence_ks
     ):
         raise HeadroomError("convergence_ks must contain positive integers")
+    clusters = [trace.problem_id for trace in traces]
     panel = build_panel(traces, lam, token_scale)
     lsm_times, policies, folds = cross_fit_lsm(panel, lsm_config, n_folds, seed)
     full_tokens = float(panel.cum_tokens[np.arange(len(traces)), panel.horizons - 1].mean())
@@ -101,7 +103,7 @@ def headroom_report(
                 method,
                 family,
                 result.value,
-                bootstrap_mean_ci(values, seed=seed),
+                cluster_bootstrap_mean_ci(values, clusters, seed=seed),
                 result.accuracy,
                 result.mean_tokens,
                 savings,
@@ -155,6 +157,7 @@ def headroom_report(
     add("LSM-cross-fit", "learned", lsm_times)
     lower = rows[-1].value
     notes = ["Intervals condition on fitted policies; they do not include training uncertainty."]
+    notes.append("Confidence intervals and dual standard errors are clustered by problem.")
     upper, se = float("nan"), float("nan")
     paired = float("nan")
     paired_ci = (float("nan"), float("nan"))
@@ -165,15 +168,15 @@ def headroom_report(
             values[indices] = dual_upper_bound(panel.subset(indices), policy.value).per_trace
         differences = values - panel.payoff[np.arange(len(traces)), lsm_times]
         paired = float(differences.mean())
-        paired_ci = bootstrap_mean_ci(differences, seed=seed)
+        paired_ci = cluster_bootstrap_mean_ci(differences, clusters, seed=seed)
         upper = float(values.mean())
-        se = float(values.std(ddof=1) / np.sqrt(len(values)))
+        se = cluster_standard_error(values, clusters)
         rows.append(
             HeadroomRow(
                 "dual-upper-cross-fit",
                 "bound",
                 upper,
-                bootstrap_mean_ci(values, seed=seed),
+                cluster_bootstrap_mean_ci(values, clusters, seed=seed),
                 float("nan"),
                 float("nan"),
                 float("nan"),
