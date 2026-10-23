@@ -42,9 +42,17 @@ class HFBackend:
             if target == "cpu":
                 dtype = "float32"
             else:
-                bf16 = (target == "cuda" and torch.cuda.is_bf16_supported()) or (
-                    target == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available()
-                )
+                if target == "cuda":
+                    # Tensor creation can report emulated bf16 support on T4/P100.
+                    # Sharded models must use a dtype suited to every visible GPU.
+                    indices = (
+                        range(torch.cuda.device_count())
+                        if device == "auto"
+                        else [int(device.split(":", 1)[1]) if ":" in device else None]
+                    )
+                    bf16 = all(torch.cuda.get_device_capability(index)[0] >= 8 for index in indices)
+                else:
+                    bf16 = target == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available()
                 dtype = "bfloat16" if bf16 else "float16"
         self.attn_implementation = attn_implementation
         if score_chunk_size < 1:
