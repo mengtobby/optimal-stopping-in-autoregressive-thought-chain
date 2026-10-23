@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from osc.data.io import load_traceset
-from osc.pilots.elicit import run_elicitation_pilot
+from osc.pilots.elicit import run_elicitation_pilot_detailed
 
 
 def _json_value(value: Any) -> Any:
@@ -38,7 +38,14 @@ def main() -> None:
         help="collection CollectConfig.max_steps (defaults to trace metadata)",
     )
     parser.add_argument("--include-censored", action="store_true")
+    parser.add_argument("--method", choices=("distribution", "greedy"), default="distribution")
+    parser.add_argument("--max-k", type=int, default=30)
+    parser.add_argument("--min-mass", type=float, default=0.0)
     args = parser.parse_args()
+    if not 0 <= args.max_k <= 10000:
+        parser.error("--max-k must be in [0, 10000]")
+    if not math.isfinite(args.min_mass) or not 0 <= args.min_mass <= 1:
+        parser.error("--min-mass must be finite and in [0, 1]")
     if args.every < 1:
         parser.error("--every must be positive")
     if args.max_steps is not None and args.max_steps < 1:
@@ -62,17 +69,28 @@ def main() -> None:
     from osc.collect.hf_backend import HFBackend
 
     backend = HFBackend(args.model)
-    result = run_elicitation_pilot(
+    result, details = run_elicitation_pilot_detailed(
         backend,
         traces,
         prompts,
         every=args.every,
         include_censored=args.include_censored,
         max_steps=args.max_steps,
+        method=args.method,
+        max_k=args.max_k,
+        min_mass=args.min_mass,
     )
+    payload = asdict(result)
+    payload["per_trace"] = [
+        {"expected": detail.expected, "mode": detail.mode, "mass": detail.mass}
+        for detail in details
+    ]
+    masses = np.concatenate([detail.mass for detail in details]) if details else np.array([])
+    finite_mass = masses[np.isfinite(masses)]
+    payload["mean_mass"] = float(finite_mass.mean()) if finite_mass.size else float("nan")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(
-        json.dumps(_json_value(asdict(result)), indent=2, allow_nan=False), encoding="utf-8"
+        json.dumps(_json_value(payload), indent=2, allow_nan=False), encoding="utf-8"
     )
 
 

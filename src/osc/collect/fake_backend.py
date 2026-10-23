@@ -14,6 +14,7 @@ class FakeBackend:
         natural_stop: bool = True,
         feature_dim: int = 3,
         completion: str = "1",
+        scores: Mapping[str, float] | None = None,
     ) -> None:
         if feature_dim < 1 or not continuations:
             raise ValueError("feature_dim must be positive and continuations nonempty")
@@ -24,6 +25,28 @@ class FakeBackend:
         self.feature_dim = feature_dim
         self.completion = completion
         self.hidden_features_calls = 0
+        self.scores = dict(scores) if scores is not None else None
+        self.score_calls: list = []
+
+    def score_continuations(
+        self,
+        prompt: str,
+        thinking_prefix: str,
+        probe: str,
+        candidates: Sequence[str],
+        require_non_digit_next: bool = False,
+    ) -> np.ndarray:
+        self.score_calls.append(
+            (prompt, thinking_prefix, probe, tuple(candidates), require_non_digit_next)
+        )
+        if self.scores is not None:
+            missing = set(candidates) - self.scores.keys()
+            if missing:
+                raise ValueError(f"missing scripted scores: {sorted(missing)}")
+        return np.array(
+            [self.scores[c] if self.scores is not None else -float(len(c)) for c in candidates],
+            dtype=float,
+        )
 
     def generate_thinking(self, prompt: str, max_tokens: int) -> tuple[str, bool]:
         text = self.thinking[prompt] if isinstance(self.thinking, Mapping) else self.thinking

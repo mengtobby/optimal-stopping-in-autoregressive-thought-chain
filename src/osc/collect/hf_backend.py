@@ -1,6 +1,8 @@
 """Optional Transformers backend; model dependencies are imported only on construction."""
 
 from collections.abc import Sequence
+from contextlib import contextmanager
+from copy import deepcopy
 
 import numpy as np
 
@@ -19,6 +21,7 @@ class HFBackend:
         temperature: float = 0.6,
         top_p: float = 0.95,
         seed: int = 0,
+        score_chunk_size: int = 8,
     ) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
@@ -27,6 +30,9 @@ class HFBackend:
             raise BackendError("invalid sampling parameters or empty feature_layers")
         if dtype not in ("float32", "float16", "bfloat16"):
             raise BackendError("dtype must be float32, float16, or bfloat16")
+        if score_chunk_size < 1:
+            raise BackendError("score_chunk_size must be positive")
+        self.score_chunk_size = score_chunk_size
         set_seed(seed)
         self.torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -34,7 +40,7 @@ class HFBackend:
             raise BackendError("a fast tokenizer with character offsets is required")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=getattr(torch, dtype),
+            dtype=getattr(torch, dtype),
             device_map=device if device == "auto" else None,
             attn_implementation="eager",
         )
@@ -43,6 +49,121 @@ class HFBackend:
         self.model.eval()
         self.feature_layers = tuple(feature_layers)
         self.temperature, self.top_p = temperature, top_p
+        self._digit_token_ids = self._find_digit_token_ids()
+
+    def _find_digit_token_ids(self) -> list[int]:
+        return [
+            i
+            for i in range(len(self.tokenizer))
+            if self.tokenizer.decode([i], skip_special_tokens=False)[:1].isdigit()
+        ]
+
+    def score_continuations(
+        self,
+        prompt: str,
+        thinking_prefix: str,
+        probe: str,
+        candidates: Sequence[str],
+        require_non_digit_next: bool = False,
+    ) -> np.ndarray:
+        """Score whole-string tokenizations; context must end at a token boundary."""
+        if not candidates:
+            return np.empty(0, dtype=float)
+        context = self._prompt(prompt) + thinking_prefix + probe
+        context_ids = self.tokenizer.encode(context, add_special_tokens=False)
+        if not context_ids:
+            raise BackendError("context must contain at least one token")
+        suffixes = []
+        for candidate in candidates:
+            encoded = self.tokenizer(
+                context + candidate, add_special_tokens=False, return_offsets_mapping=True
+            )
+            if any(a < len(context) < b for a, b in encoded["offset_mapping"]):
+                raise BackendError("candidate straddles the context token boundary")
+            ids = encoded["input_ids"]
+            if ids[: len(context_ids)] != context_ids:
+                raise BackendError("candidate changes the context token boundary")
+            suffixes.append(ids[len(context_ids) :])
+        if require_non_digit_next and not hasattr(self, "_digit_token_ids"):
+            self._digit_token_ids = self._find_digit_token_ids()
+        torch = self.torch
+        scores = []
+        chunk_size = getattr(self, "score_chunk_size", 8)
+        with self._scoring_attention(), torch.inference_mode():
+            prefix = torch.tensor([context_ids], device=self.model.device)
+            output = self.model(input_ids=prefix, use_cache=True, logits_to_keep=1)
+            cache = output.past_key_values
+            first_log_probs = output.logits[0, -1].float().log_softmax(-1)
+            for offset in range(0, len(suffixes), chunk_size):
+                chunk = suffixes[offset : offset + chunk_size]
+                width = max(map(len, chunk))
+                logits = None
+                if width:
+                    ids = torch.zeros(
+                        (len(chunk), width), dtype=torch.long, device=self.model.device
+                    )
+                    mask = torch.ones(
+                        (len(chunk), len(context_ids) + width),
+                        dtype=torch.long,
+                        device=self.model.device,
+                    )
+                    for row, sequence in enumerate(chunk):
+                        ids[row, : len(sequence)] = torch.tensor(
+                            sequence, dtype=torch.long, device=self.model.device
+                        )
+                        mask[row, len(context_ids) + len(sequence) :] = 0
+                    batch_cache = self._expand_cache(cache, len(chunk))
+                    logits = self.model(
+                        input_ids=ids,
+                        attention_mask=mask,
+                        past_key_values=batch_cache,
+                        use_cache=True,
+                    ).logits
+                    del batch_cache
+                for row, sequence in enumerate(chunk):
+                    score = first_log_probs.new_zeros(())
+                    next_log_probs = first_log_probs
+                    if sequence:
+                        score = first_log_probs[sequence[0]]
+                        log_probs = logits[row, : len(sequence)].float().log_softmax(-1)
+                        if len(sequence) > 1:
+                            targets = ids[row, 1 : len(sequence), None]
+                            score = score + log_probs[:-1].gather(-1, targets).sum()
+                        next_log_probs = log_probs[-1]
+                    if require_non_digit_next:
+                        allowed = torch.ones_like(next_log_probs, dtype=torch.bool)
+                        allowed[self._digit_token_ids] = False
+                        score = score + next_log_probs[allowed].logsumexp(-1)
+                    scores.append(float(score))
+        return np.asarray(scores, dtype=float)
+
+    @staticmethod
+    def _expand_cache(cache, batch_size: int):
+        """Copy before expansion: Transformers caches mutate during suffix forwards."""
+        if isinstance(cache, tuple):
+            return tuple(
+                tuple(tensor.repeat_interleave(batch_size, dim=0) for tensor in layer)
+                for layer in cache
+            )
+        expanded = deepcopy(cache)
+        expanded.batch_repeat_interleave(batch_size)
+        return expanded
+
+    @contextmanager
+    def _scoring_attention(self):
+        """Use memory-efficient attention for prefill and restore caller configuration."""
+        configs = {}
+        for module in self.model.modules():
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "_attn_implementation"):
+                configs[id(config)] = (config, config._attn_implementation)
+        try:
+            for config, _ in configs.values():
+                config._attn_implementation = "sdpa"
+            yield
+        finally:
+            for config, implementation in configs.values():
+                config._attn_implementation = implementation
 
     def _prompt(self, prompt: str) -> str:
         text = self.tokenizer.apply_chat_template(
@@ -76,8 +197,33 @@ class HFBackend:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def force_answers(self, prompt: str, thinking_prefix: str, n_samples: int) -> list[str]:
+        if n_samples < 0:
+            raise BackendError("n_samples must be nonnegative")
+        if n_samples == 0:
+            return []
         text = self._prompt(prompt) + thinking_prefix + "\n</think>\n\n**Final Answer**\n\\boxed{"
-        return ["\\boxed{" + self._sample(text, 256) for _ in range(n_samples)]
+        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(
+            self.model.device
+        )
+        options = {"do_sample": self.temperature > 0}
+        if options["do_sample"]:
+            options.update(temperature=self.temperature, top_p=self.top_p)
+        # Greedy generation cannot return multiple sequences; repeat its identical result.
+        count = n_samples if options["do_sample"] else 1
+        with self.torch.inference_mode():
+            output = self.model.generate(
+                **encoded,
+                max_new_tokens=256,
+                num_return_sequences=count,
+                pad_token_id=self.tokenizer.eos_token_id,
+                **options,
+            )
+        answers = [
+            "\\boxed{"
+            + self.tokenizer.decode(row[encoded.input_ids.shape[1] :], skip_special_tokens=True)
+            for row in output
+        ]
+        return answers if options["do_sample"] else answers * n_samples
 
     def continue_steps(
         self, prompt: str, thinking_prefix: str, k: int, max_tokens: int

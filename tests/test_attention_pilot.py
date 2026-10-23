@@ -125,6 +125,12 @@ def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
         def complete(self, *args):
             return "2"
 
+        def score_continuations(
+            self, prompt, thinking_prefix, probe, candidates, require_non_digit_next=False
+        ):
+            assert require_non_digit_next
+            return np.full(len(candidates), -np.log(len(candidates)))
+
     module = ModuleType("osc.collect.hf_backend")
     module.HFBackend = FakeHF
     monkeypatch.setitem(sys.modules, "osc.collect.hf_backend", module)
@@ -155,6 +161,9 @@ def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
         assert result["n_traces"] == (0 if excluded else 1)
         assert result["n_excluded"] == int(excluded)
         assert result["parse_rate"] == (None if excluded else 1)
+        assert result["mean_mass"] == (None if excluded else pytest.approx(1))
+        assert len(result["per_trace"]) == 1
+        assert result["per_trace"][0]["expected"] == ([None] * 4 if excluded else [15] * 4)
 
 
 def test_runner_skips_missing_and_empty_spans(monkeypatch):
