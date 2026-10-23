@@ -53,6 +53,12 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--seed", type=int, default=0)
     result.add_argument("--force", action="store_true")
+    result.add_argument(
+        "--keep-backups",
+        type=int,
+        default=1,
+        help="backups and partial outputs to keep each after successful collect (default: 1)",
+    )
     result.add_argument("--refresh-problems", action="store_true")
     result.add_argument("--score-chunk-size", type=int, default=8)
     defaults = CollectConfig()
@@ -129,6 +135,42 @@ def merged_fingerprint(workdir: Path) -> str | None:
         return None
 
 
+def cached_fingerprint(args: argparse.Namespace) -> str | None:
+    """Reuse fingerprints while merged file sizes and modification times are unchanged."""
+    merged = args.workdir / "traces" / "merged"
+    state = []
+    for name in ("metadata.json", "traces.jsonl", "arrays.npz"):
+        try:
+            stat = (merged / name).stat()
+            state.append((stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            state.append(None)
+    key = tuple(state)
+    cache = getattr(args, "_fingerprints", None)
+    if cache is None:
+        cache = args._fingerprints = {}
+    if key not in cache:
+        cache[key] = merged_fingerprint(args.workdir)
+    return cache[key]
+
+
+def prune_backups(args: argparse.Namespace) -> None:
+    """Bound each kind of saved merged directory, oldest timestamp first."""
+    for label in ("bak", "partial"):
+        paths = sorted(
+            (path for path in (args.workdir / "traces").glob(f"merged.{label}-*") if path.is_dir()),
+            key=lambda path: (
+                int(path.name.rsplit("-", 1)[1])
+                if path.name.rsplit("-", 1)[1].isdigit()
+                else path.stat().st_mtime_ns,
+                path.name,
+            ),
+        )
+        for path in paths[: max(0, len(paths) - args.keep_backups)]:
+            shutil.rmtree(path)
+            LOGGER.info("Removed old merged %s directory %s", label, path)
+
+
 def dated_path(path: Path, label: str) -> Path:
     """Choose a unique sibling name, including for multiple invocations in one second."""
     return path.with_name(f"{path.name}.{label}-{time.time_ns()}")
@@ -137,7 +179,12 @@ def dated_path(path: Path, label: str) -> Path:
 def prepare_collection(args: argparse.Namespace) -> Path | None:
     merged = args.workdir / "traces" / "merged"
     backup = None
-    if merged_fingerprint(args.workdir) is not None:
+    collected, _ = collection_progress(args)
+    expected = problem_ids(args)
+    if cached_fingerprint(args) is not None and (
+        args.force
+        or sum(trace.problem_id in expected for trace in load_traceset(merged)) > collected
+    ):
         backup = dated_path(merged, "bak")
         shutil.copytree(merged, backup)
         LOGGER.warning("Preserving existing merged traces before collection in %s", backup)
@@ -160,7 +207,7 @@ def restore_collection(args: argparse.Namespace, backup: Path | None) -> str:
     if not old_ids <= expected:
         return ""
     old_count = len(old_ids)
-    if merged_fingerprint(args.workdir) is not None:
+    if cached_fingerprint(args) is not None:
         new_ids = {trace.problem_id for trace in load_traceset(merged)}
         if len(new_ids & expected) >= old_count:
             return ""
@@ -168,7 +215,9 @@ def restore_collection(args: argparse.Namespace, backup: Path | None) -> str:
     if merged.exists():
         merged.rename(partial)
     shutil.copytree(backup, merged)
-    message = f"restored {old_count} problems from {backup.name}; partial output: {partial.name}"
+    message = f"restored {old_count} problems from {backup.name}"
+    if partial.exists():
+        message += f"; partial output: {partial.name}"
     LOGGER.warning(message)
     return message
 
@@ -204,7 +253,7 @@ def stage_complete(stage: str, args: argparse.Namespace) -> bool:
         ):
             LOGGER.warning("Merged traces are incomplete or invalid; re-merging from shards")
             return False
-    fingerprint = merged_fingerprint(args.workdir)
+    fingerprint = cached_fingerprint(args)
     if fingerprint is None:
         return False
     for output in outputs:
@@ -369,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
         cli.error("--limit must be positive")
     if any(not math.isfinite(lam) or lam < 0 for lam in args.lam):
         cli.error("--lam values must be finite and nonnegative")
+    if args.keep_backups < 0:
+        cli.error("--keep-backups must be nonnegative")
     if args.score_chunk_size < 1:
         cli.error("--score-chunk-size must be positive")
     requested = args.stages.split(",")
@@ -396,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
         for stage in STAGES:
             if stage not in requested:
                 continue
+            restoration = ""
             started = time.monotonic()
             remaining = deadline - started
             try:
@@ -416,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
                 LOGGER.info("Starting %s with %.1f seconds remaining", stage, remaining)
                 try:
                     input_count = trace_count(args)
-                    fingerprint = merged_fingerprint(args.workdir)
+                    fingerprint = cached_fingerprint(args)
                     if stage != "collect":
                         for output in stage_outputs(stage, args):
                             provenance_path(output).unlink(missing_ok=True)
@@ -427,8 +479,7 @@ def main(argv: list[str] | None = None) -> int:
                     finally:
                         if stage == "collect":
                             restoration = restore_collection(args, backup)
-                            if restoration:
-                                records.append(("collect recovery", restoration, 0.0))
+
                     if not all(path.exists() for path in stage_outputs(stage, args)):
                         raise ValueError("stage returned without expected outputs")
                     if stage != "collect":
@@ -439,12 +490,25 @@ def main(argv: list[str] | None = None) -> int:
                                 ),
                                 encoding="utf-8",
                             )
+                    if stage == "collect":
+                        prune_backups(args)
+                        if restoration:
+                            restored, separator, partial_name = restoration.partition(
+                                "; partial output: "
+                            )
+                            if backup is not None and not backup.exists():
+                                restored = restored.split(" from ")[0]
+                            restoration = restored
+                            if separator and (args.workdir / "traces" / partial_name).exists():
+                                restoration += separator + partial_name
                     status = "completed"
                 except Exception as exc:
                     LOGGER.exception("Stage %s failed", stage)
                     status = f"failed: {type(exc).__name__}: {str(exc).replace('|', '/')}"
                     failed = True
             records.append((stage, status, time.monotonic() - started))
+            if restoration:
+                records.append(("collect recovery", restoration, 0.0))
     finally:
         write_summary(args, records)
     return int(failed)

@@ -204,6 +204,7 @@ def test_collection_can_finish_in_flight_problem_and_run_pilots(cloud, monkeypat
         ["--collect-reserve-minutes", "0"],
         ["--collect-reserve-minutes", "-1"],
         ["--limit", "0"],
+        ["--keep-backups", "-1"],
         ["--stages", "bad"],
         ["--stages", "collect,collect"],
         ["--lam", "-1"],
@@ -456,3 +457,84 @@ def test_refresh_keeps_smaller_current_dataset_and_resume_settles(cloud, monkeyp
     assert runner.main(flags) == 0
     assert calls == []
     assert list((work / "traces").glob("merged.bak-*")) == [backup]
+
+
+def test_ordinary_partial_resume_creates_no_backup(cloud):
+    work, _, _ = cloud
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    with (work / "problems.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps({"problem_id": "q", "prompt": "q", "answer": "1", "source": "test"}) + "\n"
+        )
+    assert runner.main(flags) == 0
+    assert not list((work / "traces").glob("merged.bak-*"))
+
+
+@pytest.mark.parametrize("keep", [0, 1, 2])
+def test_success_prunes_oldest_backups(cloud, caplog, keep):
+    import os
+
+    work, _, _ = cloud
+    flags = ["--workdir", str(work), "--stages", "collect"]
+    assert runner.main(flags) == 0
+    for label in ("bak", "partial"):
+        for index in range(3):
+            path = work / "traces" / f"merged.{label}-{index}"
+            path.mkdir()
+            os.utime(path, ns=(index + 1, index + 1))
+    # A pending problem makes collection run without needing a new backup.
+    (work / "traces/merged/arrays.npz").unlink()
+    with caplog.at_level("INFO"):
+        assert runner.main([*flags, "--keep-backups", str(keep)]) == 0
+    for label in ("bak", "partial"):
+        assert sorted(path.name for path in (work / "traces").glob(f"merged.{label}-*")) == [
+            f"merged.{label}-{index}" for index in range(3 - keep, 3)
+        ]
+    assert "Removed old merged" in caplog.text
+
+
+def test_fingerprint_loads_once_per_state(cloud, monkeypatch):
+    work, _, stage = cloud
+    flags = ["--workdir", str(work), "--stages", "collect"]
+    assert runner.main(flags) == 0
+    loads = []
+    original = runner.load_traceset
+
+    def load(path):
+        loads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(runner, "load_traceset", load)
+    assert runner.main(["--workdir", str(work), "--stages", "headroom,elicit,flips"]) == 0
+    assert loads == [work / "traces/merged"]
+    args = runner.parser().parse_args(flags)
+    runner.cached_fingerprint(args)
+    runner.cached_fingerprint(args)
+    assert len(loads) == 2
+    stage("collect", args, 60)
+    runner.cached_fingerprint(args)
+    runner.cached_fingerprint(args)
+    assert len(loads) == 3
+
+
+@pytest.mark.parametrize("keep", [0, 1])
+def test_recovery_without_partial_and_summary_order(cloud, monkeypatch, keep):
+    import shutil
+
+    work, _, _ = cloud
+    save_traceset(traces_for("p"), work / "traces/merged")
+
+    def missing(name, args, remaining):
+        shutil.rmtree(args.workdir / "traces/merged")
+
+    monkeypatch.setattr(runner, "run_stage", missing)
+    assert (
+        runner.main(["--workdir", str(work), "--stages", "collect", "--keep-backups", str(keep)])
+        == 0
+    )
+    summary = (work / "SUMMARY.md").read_text()
+    assert "merged.partial-" not in summary
+    assert summary.index("| collect |") < summary.index("| collect recovery |")
+    if keep == 0:
+        assert "merged.bak-" not in summary
