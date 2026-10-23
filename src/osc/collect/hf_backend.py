@@ -1,6 +1,8 @@
 """Optional Transformers backend; model dependencies are imported only on construction."""
 
 from collections.abc import Sequence
+from contextlib import contextmanager
+from copy import deepcopy
 
 import numpy as np
 
@@ -65,50 +67,103 @@ class HFBackend:
         require_non_digit_next: bool = False,
     ) -> np.ndarray:
         """Score whole-string tokenizations; context must end at a token boundary."""
+        if not candidates:
+            return np.empty(0, dtype=float)
         context = self._prompt(prompt) + thinking_prefix + probe
-        sequences, starts = [], []
+        context_ids = self.tokenizer.encode(context, add_special_tokens=False)
+        if not context_ids:
+            raise BackendError("context must contain at least one token")
+        suffixes = []
         for candidate in candidates:
             encoded = self.tokenizer(
                 context + candidate, add_special_tokens=False, return_offsets_mapping=True
             )
-            offsets = encoded["offset_mapping"]
-            if any(a < len(context) < b for a, b in offsets):
+            if any(a < len(context) < b for a, b in encoded["offset_mapping"]):
                 raise BackendError("candidate straddles the context token boundary")
-            indices = [i for i, (a, b) in enumerate(offsets) if a >= len(context) and b > a]
-            start = indices[0] if indices else len(encoded["input_ids"])
-            if start == 0:
-                raise BackendError("context must contain at least one token")
-            sequences.append(encoded["input_ids"])
-            starts.append(start)
+            ids = encoded["input_ids"]
+            if ids[: len(context_ids)] != context_ids:
+                raise BackendError("candidate changes the context token boundary")
+            suffixes.append(ids[len(context_ids) :])
         if require_non_digit_next and not hasattr(self, "_digit_token_ids"):
             self._digit_token_ids = self._find_digit_token_ids()
         torch = self.torch
         scores = []
         chunk_size = getattr(self, "score_chunk_size", 8)
-        for offset in range(0, len(sequences), chunk_size):
-            chunk = sequences[offset : offset + chunk_size]
-            width = max(map(len, chunk))
-            ids = torch.zeros((len(chunk), width), dtype=torch.long, device=self.model.device)
-            mask = torch.zeros_like(ids)
-            for row, sequence in enumerate(chunk):
-                ids[row, : len(sequence)] = torch.tensor(sequence, device=self.model.device)
-                mask[row, : len(sequence)] = 1
-            with torch.inference_mode():
-                logits = self.model(input_ids=ids, attention_mask=mask, use_cache=False).logits
-                for row, sequence in enumerate(chunk):
-                    start, end = starts[offset + row], len(sequence)
-                    positions = torch.arange(start, end, device=ids.device)
-                    log_probs = logits[row, start - 1 : end - 1].float().log_softmax(-1)
-                    score = log_probs.gather(-1, ids[row, positions, None]).sum()
-                    if require_non_digit_next:
-                        next_log_probs = logits[row, end - 1].float().log_softmax(-1)
-                        allowed = torch.ones(
-                            next_log_probs.shape[-1], dtype=torch.bool, device=ids.device
+        with self._scoring_attention(), torch.inference_mode():
+            prefix = torch.tensor([context_ids], device=self.model.device)
+            output = self.model(input_ids=prefix, use_cache=True, logits_to_keep=1)
+            cache = output.past_key_values
+            first_log_probs = output.logits[0, -1].float().log_softmax(-1)
+            for offset in range(0, len(suffixes), chunk_size):
+                chunk = suffixes[offset : offset + chunk_size]
+                width = max(map(len, chunk))
+                logits = None
+                if width:
+                    ids = torch.zeros(
+                        (len(chunk), width), dtype=torch.long, device=self.model.device
+                    )
+                    mask = torch.ones(
+                        (len(chunk), len(context_ids) + width),
+                        dtype=torch.long,
+                        device=self.model.device,
+                    )
+                    for row, sequence in enumerate(chunk):
+                        ids[row, : len(sequence)] = torch.tensor(
+                            sequence, dtype=torch.long, device=self.model.device
                         )
+                        mask[row, len(context_ids) + len(sequence) :] = 0
+                    batch_cache = self._expand_cache(cache, len(chunk))
+                    logits = self.model(
+                        input_ids=ids,
+                        attention_mask=mask,
+                        past_key_values=batch_cache,
+                        use_cache=True,
+                    ).logits
+                    del batch_cache
+                for row, sequence in enumerate(chunk):
+                    score = first_log_probs.new_zeros(())
+                    next_log_probs = first_log_probs
+                    if sequence:
+                        score = first_log_probs[sequence[0]]
+                        log_probs = logits[row, : len(sequence)].float().log_softmax(-1)
+                        if len(sequence) > 1:
+                            targets = ids[row, 1 : len(sequence), None]
+                            score = score + log_probs[:-1].gather(-1, targets).sum()
+                        next_log_probs = log_probs[-1]
+                    if require_non_digit_next:
+                        allowed = torch.ones_like(next_log_probs, dtype=torch.bool)
                         allowed[self._digit_token_ids] = False
                         score = score + next_log_probs[allowed].logsumexp(-1)
                     scores.append(float(score))
         return np.asarray(scores, dtype=float)
+
+    @staticmethod
+    def _expand_cache(cache, batch_size: int):
+        """Copy before expansion: Transformers caches mutate during suffix forwards."""
+        if isinstance(cache, tuple):
+            return tuple(
+                tuple(tensor.repeat_interleave(batch_size, dim=0) for tensor in layer)
+                for layer in cache
+            )
+        expanded = deepcopy(cache)
+        expanded.batch_repeat_interleave(batch_size)
+        return expanded
+
+    @contextmanager
+    def _scoring_attention(self):
+        """Use memory-efficient attention for prefill and restore caller configuration."""
+        configs = {}
+        for module in self.model.modules():
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "_attn_implementation"):
+                configs[id(config)] = (config, config._attn_implementation)
+        try:
+            for config, _ in configs.values():
+                config._attn_implementation = "sdpa"
+            yield
+        finally:
+            for config, implementation in configs.values():
+                config._attn_implementation = implementation
 
     def _prompt(self, prompt: str) -> str:
         text = self.tokenizer.apply_chat_template(
