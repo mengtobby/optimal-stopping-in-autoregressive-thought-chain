@@ -76,9 +76,16 @@ sampling dominate runtime; eager attention also increases pilot memory use.
 Start with `--limit 5 --max-hours 0.5` to measure your workload before a large run.
 
 The total budget starts before problem loading. Each stage subprocess has a hard
-timeout equal to the remaining budget. Collection also receives a soft deadline
-slightly earlier to allow merging completed shards. An individual problem may
-exceed that soft deadline and be interrupted by the hard timeout. Later stages
+timeout equal to the remaining budget. Collection's soft deadline reserves the
+larger of **30 minutes or 25% of the remaining budget** for the in-flight problem,
+merging completed shards, and downstream stages. Adjust the minimum with
+`--collect-reserve-minutes` if measured per-problem runtimes require more margin.
+For example, with 11 hours remaining, collection stops starting new problems
+after 8.25 hours, leaving 2.75 hours for finishing, merging, and pilots. If the
+remaining budget is smaller than the reserve, the soft collection window is
+floored at one second (or 10% of the remaining time when below ten seconds).
+The collector checks this deadline between problems; a problem taking longer
+than the reserved margin can still hit the hard timeout. Later stages
 are attempted after failures while time remains. If collection consumes the
 budget, pilots wait for a later invocation; free sessions cannot promise that all
 stages finish in one run. Setup time before the runner is outside its budget.
