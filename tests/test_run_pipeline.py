@@ -9,12 +9,18 @@ from pathlib import Path
 import pytest
 
 from osc.collect.datasets import Problem
+from osc.data.io import load_traceset, save_traceset
+from osc.data.schema import Trace, TraceSet
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("cloud_pipeline", ROOT / "scripts/run_pipeline.py")
 runner = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runner)
 RUN_STAGE = runner.run_stage
+
+
+def traces_for(*ids: str) -> TraceSet:
+    return TraceSet(tuple(Trace(pid, ("",), [0], ("1",), [1], [[0]], True, 1) for pid in ids))
 
 
 @pytest.fixture
@@ -25,14 +31,16 @@ def cloud(monkeypatch, tmp_path):
     def stage(name, args, remaining):
         calls.append((name, remaining))
         if name == "collect":
+            ids = []
             for line in (args.workdir / "problems.jsonl").read_text().splitlines():
                 problem_id = json.loads(line)["problem_id"]
+                ids.append(problem_id)
                 shard = (
                     args.workdir / "traces/shards" / hashlib.sha256(problem_id.encode()).hexdigest()
                 )
-                shard.mkdir(parents=True, exist_ok=True)
-                for filename in ("metadata.json", "traces.jsonl", "arrays.npz"):
-                    (shard / filename).write_text("{}")
+                save_traceset(traces_for(problem_id), shard)
+            save_traceset(traces_for(*ids), args.workdir / "traces/merged")
+            return
         for path in runner.stage_outputs(name, args):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"headroom": 0.25, "n_flip": 2}), encoding="utf-8")
@@ -267,8 +275,6 @@ def test_partial_shards_recollect_and_reports_follow_growth(cloud):
     assert [name for name, _ in calls] == ["collect"]
     assert "Collected 2 of 2 problems" in (work / "SUMMARY.md").read_text()
     calls.clear()
-    with (work / "traces/merged/traces.jsonl").open("a") as stream:
-        stream.write('\n{"problem_id": "pending"}\n')
     assert runner.main(flags) == 0
     assert [name for name, _ in calls] == ["headroom", "elicit", "flips"]
     calls.clear()
@@ -293,3 +299,41 @@ def test_force_preserves_problems_unless_explicitly_refreshed(
         flags.append("--refresh-problems")
     assert runner.main(flags) == 0
     assert (path.read_bytes() != original) == changed
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["subset", "old_arrays", "truncated_arrays", "wrong_ids", "duplicate_ids", "invalid_json"],
+)
+def test_all_shards_with_interrupted_merge_are_remerged(cloud, monkeypatch, damage):
+    work, calls, _ = cloud
+    monkeypatch.setattr(
+        runner,
+        "load_math500",
+        lambda: (Problem("p", "question", "1", "test"), Problem("q", "other", "2", "test")),
+    )
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    merged = work / "traces/merged"
+    full_json = (merged / "traces.jsonl").read_bytes()
+    if damage in ("subset", "old_arrays"):
+        save_traceset(traces_for("p"), merged)
+        if damage == "old_arrays":
+            (merged / "traces.jsonl").write_bytes(full_json)
+    elif damage == "truncated_arrays":
+        (merged / "arrays.npz").write_bytes(b"PK")
+    elif damage == "wrong_ids":
+        save_traceset(traces_for("p", "unexpected"), merged)
+    elif damage == "duplicate_ids":
+        save_traceset(traces_for("p", "p"), merged)
+    else:
+        (merged / "traces.jsonl").write_text('{"problem_id":')
+    args = runner.parser().parse_args(flags)
+    assert runner.collection_progress(args) == (2, 2)
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == ["collect"]
+    assert {trace.problem_id for trace in load_traceset(merged)} == {"p", "q"}
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
