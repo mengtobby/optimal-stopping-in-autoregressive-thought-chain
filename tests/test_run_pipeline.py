@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -270,7 +271,10 @@ def test_partial_shards_recollect_and_reports_follow_growth(cloud):
     calls.clear()
     # Add a pending problem while keeping the previous merged subset and reports.
     with (work / "problems.jsonl").open("a") as stream:
-        stream.write(json.dumps({"problem_id": "pending"}) + "\n")
+        stream.write(
+            json.dumps({"problem_id": "pending", "prompt": "q", "answer": "1", "source": "test"})
+            + "\n"
+        )
     assert runner.main([*flags, "--stages", "collect"]) == 0
     assert [name for name, _ in calls] == ["collect"]
     assert "Collected 2 of 2 problems" in (work / "SUMMARY.md").read_text()
@@ -337,3 +341,118 @@ def test_all_shards_with_interrupted_merge_are_remerged(cloud, monkeypatch, dama
     calls.clear()
     assert runner.main(flags) == 0
     assert calls == []
+
+
+@pytest.mark.parametrize("change", ["metadata", "arrays", "text", "legacy"])
+def test_content_changes_invalidate_reports(cloud, change):
+    work, calls, _ = cloud
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    merged = work / "traces/merged"
+    if change == "metadata":
+        path = merged / "metadata.json"
+        payload = json.loads(path.read_text())
+        payload["metadata"]["revision"] = 2
+        path.write_text(json.dumps(payload))
+    elif change == "legacy":
+        for path in (work / "results").glob("*.resume.json"):
+            path.write_text(json.dumps({"trace_count": 1}))
+    else:
+        trace = load_traceset(merged)[0]
+        if change == "arrays":
+            trace = replace(trace, features=trace.features + 7)
+            save_traceset(TraceSet((trace,)), merged)
+        else:
+            path = merged / "traces.jsonl"
+            payload = json.loads(path.read_text())
+            payload["step_texts"] = ["changed"]
+            path.write_text(json.dumps(payload) + "\n")
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == ["headroom", "elicit", "flips"]
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
+    assert "resume.json" not in (work / "SUMMARY.md").read_text()
+    with zipfile.ZipFile(work / "results.zip") as archive:
+        assert not any(name.endswith(".resume.json") for name in archive.namelist())
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_collection_never_shrinks_merged(cloud, monkeypatch, force):
+    work, _, _ = cloud
+    save_traceset(traces_for("p", "q"), work / "traces/merged")
+    monkeypatch.setattr(
+        runner,
+        "load_math500",
+        lambda: (Problem("p", "question", "1", "test"), Problem("q", "other", "2", "test")),
+    )
+
+    def smaller(name, args, remaining):
+        save_traceset(traces_for("p"), args.workdir / "traces/merged")
+
+    monkeypatch.setattr(runner, "run_stage", smaller)
+    flags = ["--workdir", str(work), "--stages", "collect"]
+    assert runner.main(flags + (["--force"] if force else [])) == 0
+    assert len(load_traceset(work / "traces/merged")) == 2
+    assert len(list((work / "traces").glob("merged.bak-*"))) == 1
+    partial = next((work / "traces").glob("merged.partial-*"))
+    assert len(load_traceset(partial)) == 1
+    assert "restored 2 problems" in (work / "SUMMARY.md").read_text()
+
+
+def test_force_moves_shards_before_collection(cloud, monkeypatch):
+    work, _, _ = cloud
+    old = work / "traces/shards/old"
+    old.mkdir(parents=True)
+    (old / "marker").write_text("saved")
+
+    def interrupted(name, args, remaining):
+        assert not (args.workdir / "traces/shards").exists()
+        raise ValueError("early stop")
+
+    monkeypatch.setattr(runner, "run_stage", interrupted)
+    assert runner.main(["--workdir", str(work), "--stages", "collect", "--force"]) == 1
+    saved = next((work / "traces").glob("shards.old-*"))
+    assert (saved / "old/marker").read_text() == "saved"
+
+
+@pytest.mark.parametrize("content", ['{"problem_id":', '{"problem_id": "p"}', "[]"])
+def test_malformed_problems_write_failure_summary(cloud, content):
+    work, calls, _ = cloud
+    (work / "problems.jsonl").write_text(content + "\n")
+    assert runner.main(["--workdir", str(work)]) == 1
+    assert calls == []
+    summary = (work / "SUMMARY.md").read_text()
+    assert "failed: invalid problems.jsonl" in summary
+    assert "Could not read problems.jsonl" in summary
+
+
+@pytest.mark.parametrize("new_id", ["p", "replacement"])
+def test_refresh_keeps_smaller_current_dataset_and_resume_settles(cloud, monkeypatch, new_id):
+    work, calls, _ = cloud
+    monkeypatch.setattr(
+        runner,
+        "load_math500",
+        lambda: (Problem("p", "question", "1", "test"), Problem("q", "other", "2", "test")),
+    )
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    monkeypatch.setattr(
+        runner, "load_math500", lambda: (Problem(new_id, "new question", "3", "test"),)
+    )
+    calls.clear()
+    assert runner.main([*flags, "--stages", "collect", "--refresh-problems", "--force"]) == 0
+    assert [name for name, _ in calls] == ["collect"]
+    assert {trace.problem_id for trace in load_traceset(work / "traces/merged")} == {new_id}
+    backup = next((work / "traces").glob("merged.bak-*"))
+    assert len(load_traceset(backup)) == 2
+    assert not list((work / "traces").glob("merged.partial-*"))
+    assert "restored" not in (work / "SUMMARY.md").read_text()
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == ["headroom", "elicit", "flips"]
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
+    assert list((work / "traces").glob("merged.bak-*")) == [backup]

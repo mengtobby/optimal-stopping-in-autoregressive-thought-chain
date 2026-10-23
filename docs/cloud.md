@@ -100,12 +100,25 @@ completed `traces/shards` until every ID in `problems.jsonl` has a shard, even w
 trace set is readable and contains every expected ID; an interrupted or stale merge
 is rebuilt from the completed shards. No deletion or manual cleanup is needed.
 `SUMMARY.md` reports collected X of Y problems. Reports record their merged trace
-count in `.resume.json` sidecars and rerun automatically when that count changes;
-unchanged reports are skipped. Reports without sidecars are regenerated once.
+count and a SHA-256 fingerprint in `.resume.json` sidecars. The fingerprint covers
+sorted problem IDs and the merged metadata, text, and array bytes. Reports rerun
+when content changes, even at equal trace counts; unchanged reports are skipped.
+Legacy sidecars without fingerprints are stale. Sidecars are excluded from
+`SUMMARY.md` and `results.zip`.
+
+Before collection, readable merged data is copied to `traces/merged.bak-<timestamp>`.
+This protects workdirs whose shards are missing or incomplete. If the backup IDs
+all belong to the current problem list and collection produces fewer expected
+problems or invalid merged data, the runner restores the backup,
+preserves the new output in `traces/merged.partial-<timestamp>`, and records the
+recovery in `SUMMARY.md`. A refreshed list that removes or replaces old IDs
+keeps its new merged dataset rather than restoring traces outside that list.
+Backups are retained.
 
 `problems.jsonl` is retained, including with `--force`, to keep prompts paired with
 existing traces. `--force` reruns selected stages; for collection it disables shard
-reuse. To regenerate reports explicitly, use
+reuse and moves existing shards to `traces/shards.old-<timestamp>` before
+starting, so an early stop cannot mix previous and new shards. To regenerate reports explicitly, use
 `--stages headroom,elicit,flips --force`. To replace the saved problem list, select
 collection and pass `--refresh-problems` (normally together with `--force` to
 recollect). This flag has no effect when collection is not selected. Use a fresh

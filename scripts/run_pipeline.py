@@ -9,13 +9,14 @@ import logging
 import math
 import re
 import runpy
+import shutil
 import subprocess
 import sys
 import time
 import zipfile
 from pathlib import Path
 
-from osc.collect.datasets import load_gsm8k, load_math500, save_jsonl
+from osc.collect.datasets import load_gsm8k, load_jsonl, load_math500, save_jsonl
 from osc.collect.pipeline import CollectConfig
 from osc.data.io import load_traceset
 
@@ -78,15 +79,7 @@ def problem_ids(args: argparse.Namespace) -> set[str]:
     path = args.workdir / "problems.jsonl"
     if not path.exists():
         return set()
-    ids = set()
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            if line.strip():
-                problem_id = json.loads(line)["problem_id"]
-                if not isinstance(problem_id, str) or not problem_id:
-                    raise ValueError("problem_id must be a nonempty string")
-                ids.add(problem_id)
-    return ids
+    return {problem.problem_id for problem in load_jsonl(path)}
 
 
 def collection_progress(args: argparse.Namespace) -> tuple[int, int]:
@@ -108,6 +101,76 @@ def trace_count(args: argparse.Namespace) -> int:
         return 0
     with path.open(encoding="utf-8") as stream:
         return sum(bool(line.strip()) for line in stream)
+
+
+def merged_fingerprint(workdir: Path) -> str | None:
+    """Hash validated merged IDs and serialized content without loading archive bytes at once."""
+    merged = workdir / "traces" / "merged"
+    try:
+        traces = load_traceset(merged)
+        digest = hashlib.sha256()
+        digest.update(json.dumps(sorted(trace.problem_id for trace in traces)).encode())
+        for name in ("metadata.json", "traces.jsonl", "arrays.npz"):
+            digest.update(name.encode())
+            with (merged / name).open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+        return digest.hexdigest()
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        EOFError,
+        zipfile.BadZipFile,
+    ):
+        return None
+
+
+def dated_path(path: Path, label: str) -> Path:
+    """Choose a unique sibling name, including for multiple invocations in one second."""
+    return path.with_name(f"{path.name}.{label}-{time.time_ns()}")
+
+
+def prepare_collection(args: argparse.Namespace) -> Path | None:
+    merged = args.workdir / "traces" / "merged"
+    backup = None
+    if merged_fingerprint(args.workdir) is not None:
+        backup = dated_path(merged, "bak")
+        shutil.copytree(merged, backup)
+        LOGGER.warning("Preserving existing merged traces before collection in %s", backup)
+    shards = args.workdir / "traces" / "shards"
+    if args.force and shards.exists():
+        old = dated_path(shards, "old")
+        shards.rename(old)
+        LOGGER.warning("Forced collection moved previous shards to %s", old)
+    return backup
+
+
+def restore_collection(args: argparse.Namespace, backup: Path | None) -> str:
+    if backup is None:
+        return ""
+    merged = args.workdir / "traces" / "merged"
+    expected = problem_ids(args)
+    old_ids = {trace.problem_id for trace in load_traceset(backup)}
+    # A refreshed problem list can deliberately replace or reduce the dataset.
+    # Restoring traces outside that list would leave pilots without their prompts.
+    if not old_ids <= expected:
+        return ""
+    old_count = len(old_ids)
+    if merged_fingerprint(args.workdir) is not None:
+        new_ids = {trace.problem_id for trace in load_traceset(merged)}
+        if len(new_ids & expected) >= old_count:
+            return ""
+    partial = dated_path(merged, "partial")
+    if merged.exists():
+        merged.rename(partial)
+    shutil.copytree(backup, merged)
+    message = f"restored {old_count} problems from {backup.name}; partial output: {partial.name}"
+    LOGGER.warning(message)
+    return message
 
 
 def provenance_path(output: Path) -> Path:
@@ -141,14 +204,17 @@ def stage_complete(stage: str, args: argparse.Namespace) -> bool:
         ):
             LOGGER.warning("Merged traces are incomplete or invalid; re-merging from shards")
             return False
-    count = trace_count(args)
+    fingerprint = merged_fingerprint(args.workdir)
+    if fingerprint is None:
+        return False
     for output in outputs:
         try:
-            if json.loads(provenance_path(output).read_text(encoding="utf-8")) != {
-                "trace_count": count
-            }:
+            if (
+                json.loads(provenance_path(output).read_text(encoding="utf-8")).get("fingerprint")
+                != fingerprint
+            ):
                 return False
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             return False
     return True
 
@@ -254,14 +320,18 @@ def pilot_worker(argv: list[str]) -> None:
 
 
 def write_summary(args: argparse.Namespace, records: list[tuple[str, str, float]]) -> None:
-    collected, total = collection_progress(args)
+    try:
+        collected, total = collection_progress(args)
+        progress = f"Collected {collected} of {total} problems."
+    except (OSError, ValueError, TypeError) as exc:
+        progress = f"Could not read problems.jsonl: {exc}"
     lines = [
         "# Cloud pipeline summary",
         "",
         f"Model: {args.model}",
         f"Dataset: {args.dataset}; seed: {args.seed}; dtype: {args.dtype}",
         "",
-        f"Collected {collected} of {total} problems.",
+        progress,
         "Resume by rerunning the same command / notebook with this workdir.",
         "",
         "| Stage | Status | Seconds |",
@@ -269,6 +339,8 @@ def write_summary(args: argparse.Namespace, records: list[tuple[str, str, float]
     ]
     lines.extend(f"| {stage} | {status} | {elapsed:.2f} |" for stage, status, elapsed in records)
     for path in sorted((args.workdir / "results").glob("*.json")):
+        if path.name.endswith(".resume.json"):
+            continue
         lines.extend(["", f"## {path.name}", ""])
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -282,7 +354,7 @@ def write_summary(args: argparse.Namespace, records: list[tuple[str, str, float]
     with zipfile.ZipFile(args.workdir / "results.zip", "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(summary, "SUMMARY.md")
         for path in sorted((args.workdir / "results").rglob("*")):
-            if path.is_file():
+            if path.is_file() and not path.name.endswith(".resume.json"):
                 archive.write(path, path.relative_to(args.workdir))
 
 
@@ -326,7 +398,16 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             started = time.monotonic()
             remaining = deadline - started
-            if not args.force and stage_complete(stage, args):
+            try:
+                problem_ids(args)
+                complete = not args.force and stage_complete(stage, args)
+            except (OSError, ValueError, TypeError) as exc:
+                status = f"failed: invalid problems.jsonl: {exc}"
+                LOGGER.error(status)
+                records.append((stage, status, time.monotonic() - started))
+                failed = True
+                continue
+            if complete:
                 status = "skipped (output exists)"
             elif remaining <= 0:
                 status = "skipped (budget exhausted)"
@@ -335,16 +416,28 @@ def main(argv: list[str] | None = None) -> int:
                 LOGGER.info("Starting %s with %.1f seconds remaining", stage, remaining)
                 try:
                     input_count = trace_count(args)
+                    fingerprint = merged_fingerprint(args.workdir)
                     if stage != "collect":
                         for output in stage_outputs(stage, args):
                             provenance_path(output).unlink(missing_ok=True)
-                    run_stage(stage, args, remaining)
+                    backup = prepare_collection(args) if stage == "collect" else None
+                    restoration = ""
+                    try:
+                        run_stage(stage, args, remaining)
+                    finally:
+                        if stage == "collect":
+                            restoration = restore_collection(args, backup)
+                            if restoration:
+                                records.append(("collect recovery", restoration, 0.0))
                     if not all(path.exists() for path in stage_outputs(stage, args)):
                         raise ValueError("stage returned without expected outputs")
                     if stage != "collect":
                         for output in stage_outputs(stage, args):
                             provenance_path(output).write_text(
-                                json.dumps({"trace_count": input_count}), encoding="utf-8"
+                                json.dumps(
+                                    {"trace_count": input_count, "fingerprint": fingerprint}
+                                ),
+                                encoding="utf-8",
                             )
                     status = "completed"
                 except Exception as exc:
