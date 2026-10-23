@@ -41,6 +41,9 @@ def main() -> None:
     parser.add_argument("--method", choices=("distribution", "greedy"), default="distribution")
     parser.add_argument("--max-k", type=int, default=30)
     parser.add_argument("--min-mass", type=float, default=0.0)
+    parser.add_argument(
+        "--score-chunk-size", type=int, default=8, help="candidate batch size for KV-cache copies"
+    )
     args = parser.parse_args()
     if not 0 <= args.max_k <= 10000:
         parser.error("--max-k must be in [0, 10000]")
@@ -48,6 +51,8 @@ def main() -> None:
         parser.error("--min-mass must be finite and in [0, 1]")
     if args.every < 1:
         parser.error("--every must be positive")
+    if args.score_chunk_size < 1:
+        parser.error("--score-chunk-size must be positive")
     if args.max_steps is not None and args.max_steps < 1:
         parser.error("--max-steps must be positive")
     prompts = {}
@@ -68,7 +73,10 @@ def main() -> None:
         parser.error("problems file must contain a prompt for every trace")
     from osc.collect.hf_backend import HFBackend
 
-    backend = HFBackend(args.model)
+    backend_options = (
+        {} if args.score_chunk_size == 8 else {"score_chunk_size": args.score_chunk_size}
+    )
+    backend = HFBackend(args.model, **backend_options)
     result, details = run_elicitation_pilot_detailed(
         backend,
         traces,

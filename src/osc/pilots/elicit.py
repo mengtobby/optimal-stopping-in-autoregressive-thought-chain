@@ -1,5 +1,6 @@
 """Elicit remaining steps and measure whether predicted stopping times recede."""
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from scipy.stats import spearmanr
 from osc.collect.protocol import ReasoningBackend
 from osc.data.schema import Trace, TraceSet
 from osc.pilots.flips import step_ends, thinking_text
+
+logger = logging.getLogger(__name__)
 
 LEGACY_PROBE = (
     "How many more reasoning steps do you need before giving your final answer? "
@@ -95,8 +98,11 @@ def elicit_remaining_distribution(
             ),
             dtype=float,
         )
-        if scores.shape != (max_k + 1,) or np.any(np.isnan(scores)) or np.any(scores > 0):
+        if scores.shape != (max_k + 1,) or np.any(np.isnan(scores)) or np.any(scores > 1e-4):
             raise ElicitationError("scores must be one non-positive log-probability per candidate")
+        if np.any(scores > 0):
+            logger.debug("Clamping tiny positive candidate log-probabilities to zero")
+            scores = np.minimum(scores, 0)
         result.mass[t] = np.exp(scores).sum()
         peak = scores.max()
         if np.isneginf(peak):
@@ -116,6 +122,10 @@ def elicit_remaining(
     probe: str = DEFAULT_PROBE,
     max_tokens: int = 8,
 ) -> np.ndarray:
+    """Elicit counts using DEFAULT_PROBE, the stem ending in 'Number of further steps:'.
+
+    Pass LEGACY_PROBE to reproduce the old question-style probe.
+    """
     if every < 1 or max_tokens < 1:
         raise ElicitationError("every and max_tokens must be positive")
     planned = np.full(trace.n_steps, np.nan)
@@ -288,7 +298,12 @@ def run_elicitation_pilot(
     min_mass: float = 0.0,
     max_k: int = 30,
 ) -> ConsistencyStats:
-    """Return consistency statistics for distributional or greedy step forecasts."""
+    """Return consistency statistics for distributional or greedy step forecasts.
+
+    DEFAULT_PROBE is the stem probe ending in 'Number of further steps:'.
+    LEGACY_PROBE reproduces the old question-style probe when passed directly to
+    elicit_remaining or elicit_remaining_distribution.
+    """
     return run_elicitation_pilot_detailed(
         backend, traces, prompts, every, include_censored, max_steps, method, min_mass, max_k
     )[0]
