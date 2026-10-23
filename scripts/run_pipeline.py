@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from osc.collect.datasets import load_gsm8k, load_math500, save_jsonl
 from osc.collect.pipeline import CollectConfig
+from osc.data.io import load_traceset
 
 LOGGER = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +52,8 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--seed", type=int, default=0)
     result.add_argument("--force", action="store_true")
+    result.add_argument("--refresh-problems", action="store_true")
+    result.add_argument("--score-chunk-size", type=int, default=8)
     defaults = CollectConfig()
     for name in CONFIG_FLAGS:
         result.add_argument(
@@ -67,6 +71,86 @@ def stage_outputs(stage: str, args: argparse.Namespace) -> list[Path]:
     if stage == "headroom":
         return [args.workdir / "results" / f"report_lam{lam:g}.json" for lam in args.lam]
     return [args.workdir / "results" / f"pilot_{stage}.json"]
+
+
+def problem_ids(args: argparse.Namespace) -> set[str]:
+    """Read the expected IDs independently of collection and merged output."""
+    path = args.workdir / "problems.jsonl"
+    if not path.exists():
+        return set()
+    ids = set()
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip():
+                problem_id = json.loads(line)["problem_id"]
+                if not isinstance(problem_id, str) or not problem_id:
+                    raise ValueError("problem_id must be a nonempty string")
+                ids.add(problem_id)
+    return ids
+
+
+def collection_progress(args: argparse.Namespace) -> tuple[int, int]:
+    """Count expected problem IDs with committed shards, excluding temporary shards."""
+    ids = problem_ids(args)
+    collected = 0
+    for problem_id in ids:
+        shard = args.workdir / "traces" / "shards" / hashlib.sha256(problem_id.encode()).hexdigest()
+        if all(
+            (shard / name).is_file() for name in ("metadata.json", "traces.jsonl", "arrays.npz")
+        ):
+            collected += 1
+    return collected, len(ids)
+
+
+def trace_count(args: argparse.Namespace) -> int:
+    path = args.workdir / "traces" / "merged" / "traces.jsonl"
+    if not path.exists():
+        return 0
+    with path.open(encoding="utf-8") as stream:
+        return sum(bool(line.strip()) for line in stream)
+
+
+def provenance_path(output: Path) -> Path:
+    return output.with_suffix(".resume.json")
+
+
+def stage_complete(stage: str, args: argparse.Namespace) -> bool:
+    outputs = stage_outputs(stage, args)
+    if not all(path.is_file() for path in outputs):
+        return False
+    if stage == "collect":
+        collected, total = collection_progress(args)
+        if collected != total:
+            return False
+        try:
+            # Loading validates JSON, array keys/shapes, and the NPZ archive. A kill
+            # during save can leave new JSON beside an old or truncated archive.
+            merged = load_traceset(args.workdir / "traces" / "merged")
+            return len(merged) == total and {trace.problem_id for trace in merged} == problem_ids(
+                args
+            )
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            IndexError,
+            EOFError,
+            zipfile.BadZipFile,
+        ):
+            LOGGER.warning("Merged traces are incomplete or invalid; re-merging from shards")
+            return False
+    count = trace_count(args)
+    for output in outputs:
+        try:
+            if json.loads(provenance_path(output).read_text(encoding="utf-8")) != {
+                "trace_count": count
+            }:
+                return False
+        except (OSError, ValueError):
+            return False
+    return True
 
 
 def run_stage(stage: str, args: argparse.Namespace, remaining: float) -> None:
@@ -132,6 +216,8 @@ def run_stage(stage: str, args: argparse.Namespace, remaining: float) -> None:
             "--out",
             str(stage_outputs(stage, args)[0]),
         ]
+    if stage == "elicit":
+        command.extend(["--score-chunk-size", str(args.score_chunk_size)])
     subprocess.run(command, check=True, timeout=remaining)
 
 
@@ -142,8 +228,25 @@ def pilot_worker(argv: list[str]) -> None:
     stage, dtype, seed, *flags = argv
     original = hf_backend.HFBackend
 
-    def backend(model_name: str):
-        return original(model_name, dtype=dtype, seed=int(seed), attn_implementation="eager")
+    def backend(*args, **kwargs):
+        defaults = {
+            "dtype": dtype,
+            "seed": int(seed),
+            "attn_implementation": "eager" if stage == "flips" else "sdpa",
+        }
+        # Positional constructor options take precedence over injected defaults too.
+        for name in (
+            "device",
+            "dtype",
+            "feature_layers",
+            "temperature",
+            "top_p",
+            "seed",
+            "score_chunk_size",
+            "attn_implementation",
+        )[: max(0, len(args) - 1)]:
+            defaults.pop(name, None)
+        return original(*args, **{**defaults, **kwargs})
 
     hf_backend.HFBackend = backend
     sys.argv = [f"pilot_{stage}.py", *flags]
@@ -151,11 +254,15 @@ def pilot_worker(argv: list[str]) -> None:
 
 
 def write_summary(args: argparse.Namespace, records: list[tuple[str, str, float]]) -> None:
+    collected, total = collection_progress(args)
     lines = [
         "# Cloud pipeline summary",
         "",
         f"Model: {args.model}",
         f"Dataset: {args.dataset}; seed: {args.seed}; dtype: {args.dtype}",
+        "",
+        f"Collected {collected} of {total} problems.",
+        "Resume by rerunning the same command / notebook with this workdir.",
         "",
         "| Stage | Status | Seconds |",
         "| --- | --- | ---: |",
@@ -190,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
         cli.error("--limit must be positive")
     if any(not math.isfinite(lam) or lam < 0 for lam in args.lam):
         cli.error("--lam values must be finite and nonnegative")
+    if args.score_chunk_size < 1:
+        cli.error("--score-chunk-size must be positive")
     requested = args.stages.split(",")
     if any(stage not in STAGES for stage in requested) or len(set(requested)) != len(requested):
         cli.error("--stages must contain unique names from " + ",".join(STAGES))
@@ -209,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     try:
         problems_path = args.workdir / "problems.jsonl"
-        if args.force or not problems_path.exists():
+        if not problems_path.exists() or (args.refresh_problems and "collect" in requested):
             loader = load_math500 if args.dataset == "math500" else load_gsm8k
             save_jsonl(loader()[: args.limit], problems_path)
         for stage in STAGES:
@@ -217,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             started = time.monotonic()
             remaining = deadline - started
-            if not args.force and all(path.exists() for path in stage_outputs(stage, args)):
+            if not args.force and stage_complete(stage, args):
                 status = "skipped (output exists)"
             elif remaining <= 0:
                 status = "skipped (budget exhausted)"
@@ -225,9 +334,18 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 LOGGER.info("Starting %s with %.1f seconds remaining", stage, remaining)
                 try:
+                    input_count = trace_count(args)
+                    if stage != "collect":
+                        for output in stage_outputs(stage, args):
+                            provenance_path(output).unlink(missing_ok=True)
                     run_stage(stage, args, remaining)
                     if not all(path.exists() for path in stage_outputs(stage, args)):
                         raise ValueError("stage returned without expected outputs")
+                    if stage != "collect":
+                        for output in stage_outputs(stage, args):
+                            provenance_path(output).write_text(
+                                json.dumps({"trace_count": input_count}), encoding="utf-8"
+                            )
                     status = "completed"
                 except Exception as exc:
                     LOGGER.exception("Stage %s failed", stage)

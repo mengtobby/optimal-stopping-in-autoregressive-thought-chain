@@ -243,6 +243,7 @@ def test_constructor_auto_cpu_and_lazy_digits(tiny_backend, monkeypatch):
 @pytest.mark.parametrize(
     "device,capabilities,expected,checked",
     [
+        ("auto", [], "float32", []),
         ("auto", [(7, 5)], "float16", [0]),
         ("auto", [(6, 0)], "float16", [0]),
         ("auto", [(8, 0)], "bfloat16", [0]),
@@ -253,7 +254,7 @@ def test_constructor_auto_cpu_and_lazy_digits(tiny_backend, monkeypatch):
     ],
 )
 def test_auto_dtype_uses_native_cuda_capability(
-    monkeypatch, device, capabilities, expected, checked
+    monkeypatch, device, capabilities, expected, checked, caplog
 ):
     import sys
     from types import SimpleNamespace
@@ -270,7 +271,7 @@ def test_auto_dtype_uses_native_cuda_capability(
         device_count=lambda: len(capabilities),
         get_device_capability=Mock(side_effect=capability),
     )
-    torch = SimpleNamespace(cuda=cuda, float16="float16", bfloat16="bfloat16")
+    torch = SimpleNamespace(cuda=cuda, float16="float16", bfloat16="bfloat16", float32="float32")
     model = Mock()
     loader = Mock(return_value=model)
     transformers = SimpleNamespace(
@@ -286,5 +287,7 @@ def test_auto_dtype_uses_native_cuda_capability(
     assert loader.call_args.kwargs["dtype"] == expected
     assert loader.call_args.kwargs["device_map"] == ("auto" if device == "auto" else None)
     assert [call.args[0] for call in cuda.get_device_capability.call_args_list] == checked
+    if not capabilities:
+        assert "no devices were enumerated" in caplog.text
     if device != "auto":
         model.to.assert_called_once_with(device)
