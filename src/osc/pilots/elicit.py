@@ -3,6 +3,7 @@
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from scipy.stats import spearmanr
@@ -11,9 +12,13 @@ from osc.collect.protocol import ReasoningBackend
 from osc.data.schema import Trace, TraceSet
 from osc.pilots.flips import step_ends, thinking_text
 
-DEFAULT_PROBE = (
+LEGACY_PROBE = (
     "How many more reasoning steps do you need before giving your final answer? "
     "Reply with one integer from 0 to 10000 only."
+)
+DEFAULT_PROBE = (
+    "\n\nBefore continuing, I estimate the number of further reasoning steps I need before "
+    "writing the final answer. Number of further steps:"
 )
 
 
@@ -33,6 +38,76 @@ def parse_int(text: str) -> int | None:
     return value if 0 <= value <= 10000 else None
 
 
+def parse_leading_int(text: str) -> int | None:
+    """Accept a step count only at the start of the completion."""
+    match = re.match(r"\s*([+-]?\d+)", text)
+    return None if match is None else parse_int(match.group(1))
+
+
+@dataclass(frozen=True)
+class ElicitedPlans:
+    """Per-step plans; skipped rows are NaN and mass retains probe diagnostics."""
+
+    expected: np.ndarray
+    mode: np.ndarray
+    probs: np.ndarray
+    mass: np.ndarray
+
+
+def _empty_plans(n_steps: int, max_k: int) -> ElicitedPlans:
+    return ElicitedPlans(
+        np.full(n_steps, np.nan),
+        np.full(n_steps, np.nan),
+        np.full((n_steps, max_k + 1), np.nan),
+        np.full(n_steps, np.nan),
+    )
+
+
+def _validate_distribution(every: int, max_k: int) -> None:
+    if isinstance(every, bool) or not isinstance(every, (int, np.integer)) or every < 1:
+        raise ElicitationError("every must be a positive integer")
+    if (
+        isinstance(max_k, bool)
+        or not isinstance(max_k, (int, np.integer))
+        or not 0 <= max_k <= 10000
+    ):
+        raise ElicitationError("max_k must be an integer in [0, 10000]")
+
+
+def elicit_remaining_distribution(
+    backend: ReasoningBackend,
+    prompt: str,
+    trace: Trace,
+    every: int = 1,
+    probe: str = DEFAULT_PROBE,
+    max_k: int = 30,
+) -> ElicitedPlans:
+    """Score bounded integer counts, retaining their unnormalized probability mass."""
+    _validate_distribution(every, max_k)
+    result = _empty_plans(trace.n_steps, max_k)
+    thinking, ends = thinking_text(trace), step_ends(trace)
+    counts = np.arange(max_k + 1)
+    candidates = [f" {k}" for k in counts]
+    for t in range(0, trace.n_steps, every):
+        scores = np.asarray(
+            backend.score_continuations(
+                prompt, thinking[: ends[t]], probe, candidates, require_non_digit_next=True
+            ),
+            dtype=float,
+        )
+        if scores.shape != (max_k + 1,) or np.any(np.isnan(scores)) or np.any(scores > 0):
+            raise ElicitationError("scores must be one non-positive log-probability per candidate")
+        result.mass[t] = np.exp(scores).sum()
+        peak = scores.max()
+        if np.isneginf(peak):
+            continue
+        weights = np.exp(scores - peak)
+        result.probs[t] = weights / weights.sum()
+        result.expected[t] = np.dot(counts, result.probs[t])
+        result.mode[t] = np.argmax(scores)
+    return result
+
+
 def elicit_remaining(
     backend: ReasoningBackend,
     prompt: str,
@@ -47,7 +122,7 @@ def elicit_remaining(
     thinking = thinking_text(trace)
     ends = step_ends(trace)
     for t in range(0, trace.n_steps, every):
-        value = parse_int(backend.complete(prompt, thinking[: ends[t]], probe, max_tokens))
+        value = parse_leading_int(backend.complete(prompt, thinking[: ends[t]], probe, max_tokens))
         if value is not None:
             planned[t] = value
     return planned
@@ -140,22 +215,31 @@ def consistency_stats(
     )
 
 
-def run_elicitation_pilot(
+def run_elicitation_pilot_detailed(
     backend: ReasoningBackend,
     traces: TraceSet,
     prompts: Mapping[str, str],
     every: int = 1,
     include_censored: bool = False,
     max_steps: int | None = None,
-) -> ConsistencyStats:
+    method: Literal["distribution", "greedy"] = "distribution",
+    min_mass: float = 0.0,
+    max_k: int = 30,
+) -> tuple[ConsistencyStats, tuple[ElicitedPlans, ...]]:
     """Probe completed traces; optionally include traces censored by collection limits.
 
     max_steps is CollectConfig.max_steps, defaulting to collect_config in metadata.
     The empty prefix counts as a step: M steps are kept, M + 1 steps are censored.
     Traces without a natural stop are also censored.
+    Details follow input trace order, including NaN rows for excluded traces.
+    min_mass filters expected values; mode, probabilities and mass remain diagnostic.
+    Greedy details contain counts in expected/mode and NaN probabilities/mass.
     """
-    if every < 1:
-        raise ElicitationError("every must be positive")
+    _validate_distribution(every, max_k)
+    if method not in {"distribution", "greedy"}:
+        raise ElicitationError("method must be distribution or greedy")
+    if not np.isfinite(min_mass) or not 0 <= min_mass <= 1:
+        raise ElicitationError("min_mass must be finite and in [0, 1]")
     if max_steps is None:
         collect_config = traces.metadata.get("collect_config", {})
         if not isinstance(collect_config, Mapping):
@@ -171,12 +255,40 @@ def run_elicitation_pilot(
         for trace in traces
     ]
     planned = np.full((len(traces), traces.max_steps), np.nan)
+    details = []
     for i, trace in enumerate(traces):
+        detail = _empty_plans(trace.n_steps, max_k)
+        details.append(detail)
         if censored[i]:
             continue
         if trace.problem_id not in prompts:
             raise ElicitationError(f"missing prompt for {trace.problem_id!r}")
-        planned[i, : trace.n_steps] = elicit_remaining(
-            backend, prompts[trace.problem_id], trace, every
-        )
-    return consistency_stats(planned, [trace.n_steps for trace in traces], censored=censored)
+        if method == "distribution":
+            detail = elicit_remaining_distribution(
+                backend, prompts[trace.problem_id], trace, every, max_k=max_k
+            )
+            details[-1] = detail
+            detail.expected[detail.mass < min_mass] = np.nan
+        else:
+            detail.expected[:] = elicit_remaining(backend, prompts[trace.problem_id], trace, every)
+            detail.mode[:] = detail.expected
+        planned[i, : trace.n_steps] = detail.expected
+    stats = consistency_stats(planned, [trace.n_steps for trace in traces], censored=censored)
+    return stats, tuple(details)
+
+
+def run_elicitation_pilot(
+    backend: ReasoningBackend,
+    traces: TraceSet,
+    prompts: Mapping[str, str],
+    every: int = 1,
+    include_censored: bool = False,
+    max_steps: int | None = None,
+    method: Literal["distribution", "greedy"] = "distribution",
+    min_mass: float = 0.0,
+    max_k: int = 30,
+) -> ConsistencyStats:
+    """Return consistency statistics for distributional or greedy step forecasts."""
+    return run_elicitation_pilot_detailed(
+        backend, traces, prompts, every, include_censored, max_steps, method, min_mass, max_k
+    )[0]

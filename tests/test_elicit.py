@@ -7,9 +7,16 @@ from osc.pilots.elicit import (
     ElicitationError,
     consistency_stats,
     elicit_remaining,
+    elicit_remaining_distribution,
     parse_int,
+    parse_leading_int,
     run_elicitation_pilot,
+    run_elicitation_pilot_detailed,
 )
+
+
+def run_elicitation_pilot_greedy(*args, **kwargs):
+    return run_elicitation_pilot(*args, method="greedy", **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -44,13 +51,13 @@ def test_elicit_and_runner():
     result = elicit_remaining(backend, "prompt", trace, every=2)
     np.testing.assert_allclose(result, [2, np.nan, np.nan, np.nan], equal_nan=True)
     assert backend.prefixes == ["", "answer 42. " * 2]
-    stats = run_elicitation_pilot(Backend(), TraceSet((trace,)), {"p": "prompt"})
+    stats = run_elicitation_pilot_greedy(Backend(), TraceSet((trace,)), {"p": "prompt"})
     assert stats.n_elicitations == 1
     assert stats.parse_rate == 0.25
     with pytest.raises(ElicitationError):
-        run_elicitation_pilot(Backend(), TraceSet((trace,)), {})
+        run_elicitation_pilot_greedy(Backend(), TraceSet((trace,)), {})
     with pytest.raises(ElicitationError):
-        run_elicitation_pilot(Backend(), TraceSet((trace,)), {}, every=0)
+        run_elicitation_pilot_greedy(Backend(), TraceSet((trace,)), {}, every=0)
     with pytest.raises(ElicitationError):
         elicit_remaining(Backend(), "", trace, max_tokens=0)
 
@@ -102,14 +109,14 @@ def test_censored_exclusions_and_override():
     capped = make_trace()
     traces = TraceSet((natural, censored, capped))
     backend = Backend()
-    stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=3)
+    stats = run_elicitation_pilot_greedy(backend, traces, {"p": "prompt"}, max_steps=3)
     assert (stats.n_traces, stats.n_excluded) == (1, 2)
     assert len(backend.prefixes) == 3
-    included = run_elicitation_pilot(
+    included = run_elicitation_pilot_greedy(
         Backend(), traces, {"p": "prompt"}, max_steps=3, include_censored=True
     )
     assert (included.n_traces, included.n_excluded) == (3, 0)
-    excluded = run_elicitation_pilot(Backend(), TraceSet((censored,)), {})
+    excluded = run_elicitation_pilot_greedy(Backend(), TraceSet((censored,)), {})
     assert (excluded.n_traces, excluded.n_excluded, excluded.n_elicitations) == (0, 1, 0)
     assert np.isnan(excluded.parse_rate)
     stats = consistency_stats([[2, 1, 0], [0, 0, 0]], [3, 3], censored=[False, True])
@@ -128,7 +135,7 @@ def test_invalid_censor_mask(mask):
 @pytest.mark.parametrize("max_steps", [0, -1, 1.5, True])
 def test_invalid_max_steps(max_steps):
     with pytest.raises(ElicitationError, match="max_steps"):
-        run_elicitation_pilot(Backend(), TraceSet((make_trace(),)), {}, max_steps=max_steps)
+        run_elicitation_pilot_greedy(Backend(), TraceSet((make_trace(),)), {}, max_steps=max_steps)
 
 
 def test_collection_limit_boundary_and_metadata_fallback():
@@ -137,10 +144,10 @@ def test_collection_limit_boundary_and_metadata_fallback():
     )
     for max_steps in (None, 3):
         backend = Backend()
-        stats = run_elicitation_pilot(backend, traces, {"p": "prompt"}, max_steps=max_steps)
+        stats = run_elicitation_pilot_greedy(backend, traces, {"p": "prompt"}, max_steps=max_steps)
         assert (stats.n_traces, stats.n_excluded) == (1, 1)
         assert len(backend.prefixes) == 3
-    overridden = run_elicitation_pilot(Backend(), traces, {"p": "prompt"}, max_steps=4)
+    overridden = run_elicitation_pilot_greedy(Backend(), traces, {"p": "prompt"}, max_steps=4)
     assert (overridden.n_traces, overridden.n_excluded) == (2, 0)
 
 
@@ -148,4 +155,85 @@ def test_collection_limit_boundary_and_metadata_fallback():
 def test_invalid_collection_metadata(config):
     traces = TraceSet((make_trace(),), metadata={"collect_config": config})
     with pytest.raises(ElicitationError):
-        run_elicitation_pilot(Backend(), traces, {"p": "prompt"})
+        run_elicitation_pilot_greedy(Backend(), traces, {"p": "prompt"})
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [("Alright, so 48 plus", None), (" 3 steps", 3), ("-1", None), ("+12", 12)],
+)
+def test_parse_leading(text, expected):
+    assert parse_leading_int(text) == expected
+
+
+class ScoringBackend:
+    def __init__(self, scores):
+        self.scores = scores
+        self.calls = []
+
+    def score_continuations(
+        self, prompt, thinking_prefix, probe, candidates, require_non_digit_next=False
+    ):
+        self.calls.append((prompt, thinking_prefix, probe, candidates, require_non_digit_next))
+        return self.scores
+
+
+def test_distribution_and_filter():
+    backend = ScoringBackend(np.log([0.1, 0.2, 0.3]))
+    trace = make_trace()
+    result = elicit_remaining_distribution(backend, "prompt", trace, every=2, max_k=2)
+    np.testing.assert_allclose(result.expected, [4 / 3, np.nan, 4 / 3, np.nan])
+    np.testing.assert_allclose(result.mode, [2, np.nan, 2, np.nan])
+    np.testing.assert_allclose(result.mass, [0.6, np.nan, 0.6, np.nan])
+    np.testing.assert_allclose(result.probs[0], [1 / 6, 1 / 3, 1 / 2])
+    assert np.isnan(result.probs[1]).all()
+    assert backend.calls[0][1] == ""
+    assert backend.calls[1][1] == "answer 42. " * 2
+    assert backend.calls[0][3:] == ([" 0", " 1", " 2"], True)
+    stats, details = run_elicitation_pilot_detailed(
+        backend, TraceSet((trace,)), {"p": "prompt"}, max_k=2, min_mass=0.7
+    )
+    assert stats.n_elicitations == 0
+    assert np.isnan(details[0].expected).all()
+    np.testing.assert_allclose(details[0].mass, 0.6)
+    stats = run_elicitation_pilot(backend, TraceSet((trace,)), {"p": "prompt"}, max_k=2)
+    assert stats.n_elicitations == 4
+    assert stats.mean_bias == pytest.approx(-1 / 6)
+
+
+@pytest.mark.parametrize("scores", [[0], [0, np.nan], [0, 0.1], [0, np.inf]])
+def test_invalid_distribution_scores(scores):
+    with pytest.raises(ElicitationError, match="scores"):
+        elicit_remaining_distribution(ScoringBackend(scores), "", make_trace(), max_k=1)
+
+
+def test_zero_probability_distribution():
+    result = elicit_remaining_distribution(ScoringBackend([-np.inf]), "", make_trace(), max_k=0)
+    assert np.isnan(result.expected).all()
+    assert np.isnan(result.probs).all()
+    np.testing.assert_array_equal(result.mass, 0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"every": 0},
+        {"max_k": -1},
+        {"max_k": 1.5},
+        {"max_k": True},
+        {"method": "invalid"},
+        {"min_mass": -1},
+        {"min_mass": np.nan},
+    ],
+)
+def test_invalid_distribution_settings(kwargs):
+    with pytest.raises(ElicitationError):
+        run_elicitation_pilot(ScoringBackend([0]), TraceSet((make_trace(),)), {}, **kwargs)
+
+
+def test_greedy_rejects_reasoning_numbers():
+    class ReasoningBackend:
+        def complete(self, *args):
+            return "Alright, so 48 plus"
+
+    assert np.isnan(elicit_remaining(ReasoningBackend(), "", make_trace())).all()
