@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -168,7 +169,9 @@ def _remove_shard(path: Path) -> None:
         path.unlink()
 
 
-def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> TraceSet:
+def collect_dataset(
+    backend, problems, config, out_dir, resume: bool = True, deadline: float | None = None
+) -> TraceSet:
     """Collect unconditional siblings given each observed prefix and remaining budget.
 
     Stride selects prefixes only; draws are never filtered by termination or length.
@@ -177,7 +180,9 @@ def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> 
     out = Path(out_dir)
     traces = []
     totals = dict.fromkeys(SiblingStats.__dataclass_fields__, 0)
+    expired = False
     for problem in problems:
+        started = time.monotonic()
         shard = out / "shards" / hashlib.sha256(problem.problem_id.encode()).hexdigest()
         try:
             cached = None
@@ -196,6 +201,11 @@ def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> 
             if cached is not None:
                 trace = cached[0]
             else:
+                if deadline is not None and time.monotonic() >= deadline:
+                    if not expired:
+                        logger.info("collection deadline reached; merging available shards")
+                    expired = True
+                    continue
                 trace, stats = collect_trace_with_stats(backend, problem, config)
                 shard.parent.mkdir(parents=True, exist_ok=True)
                 temporary = Path(tempfile.mkdtemp(prefix=shard.name + ".tmp-", dir=shard.parent))
@@ -210,6 +220,14 @@ def collect_dataset(backend, problems, config, out_dir, resume: bool = True) -> 
             traces.append(trace)
             for name, value in asdict(stats).items():
                 totals[name] += value
+            logger.info(
+                "problem %s elapsed=%.2fs steps=%d siblings=%d natural_stop=%s",
+                problem.problem_id,
+                time.monotonic() - started,
+                trace.n_steps,
+                stats.n_draws,
+                trace.natural_stop,
+            )
         except Exception:
             logger.exception("collection failed for problem %s", problem.problem_id)
     if not traces:

@@ -1,0 +1,232 @@
+import importlib.util
+import json
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from osc.collect.datasets import Problem
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("cloud_pipeline", ROOT / "scripts/run_pipeline.py")
+runner = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(runner)
+RUN_STAGE = runner.run_stage
+
+
+@pytest.fixture
+def cloud(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "load_math500", lambda: (Problem("p", "question", "1", "test"),))
+    calls = []
+
+    def stage(name, args, remaining):
+        calls.append((name, remaining))
+        for path in runner.stage_outputs(name, args):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"headroom": 0.25, "n_flip": 2}), encoding="utf-8")
+
+    monkeypatch.setattr(runner, "run_stage", stage)
+    return tmp_path, calls, stage
+
+
+def test_order_resume_force_and_archive(cloud):
+    work, calls, _ = cloud
+    flags = ["--workdir", str(work), "--stages", "flips,headroom,collect,elicit"]
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == list(runner.STAGES)
+    assert (work / "problems.jsonl").exists()
+    summary = (work / "SUMMARY.md").read_text()
+    assert "headroom: 0.25" in summary
+    assert "n_flip: 2" in summary
+    with zipfile.ZipFile(work / "results.zip") as archive:
+        assert "SUMMARY.md" in archive.namelist()
+        assert "results/pilot_elicit.json" in archive.namelist()
+        assert not any("traces/" in name for name in archive.namelist())
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
+    assert "skipped (output exists)" in (work / "SUMMARY.md").read_text()
+    assert runner.main([*flags, "--force"]) == 0
+    assert len(calls) == 4
+
+
+def test_failure_isolation(cloud, monkeypatch):
+    work, calls, stage = cloud
+
+    def failing(name, args, remaining):
+        if name == "headroom":
+            raise ValueError("bad traces")
+        stage(name, args, remaining)
+
+    monkeypatch.setattr(runner, "run_stage", failing)
+    assert runner.main(["--workdir", str(work)]) == 1
+    assert [name for name, _ in calls] == ["collect", "elicit", "flips"]
+    assert "failed: ValueError: bad traces" in (work / "SUMMARY.md").read_text()
+    assert (work / "results.zip").exists()
+
+
+def test_budget_propagates_and_exhausts(cloud, monkeypatch):
+    work, calls, stage = cloud
+    now = [100.0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: now[0])
+
+    def advancing(name, args, remaining):
+        stage(name, args, remaining)
+        now[0] += 2
+
+    monkeypatch.setattr(runner, "run_stage", advancing)
+    assert runner.main(["--workdir", str(work), "--max-hours", str(3 / 3600)]) == 1
+    assert calls == [("collect", 3), ("headroom", 1)]
+    assert "budget exhausted" in (work / "SUMMARY.md").read_text()
+
+
+def test_subprocess_timeout_and_collection_options(cloud, monkeypatch):
+    work, _, _ = cloud
+    commands = []
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda command, **kw: commands.append((command, kw))
+    )
+    args = runner.parser().parse_args(["--workdir", str(work), "--force"])
+    for name in runner.STAGES:
+        RUN_STAGE(name, args, 60)
+    command, options = commands[0]
+    assert command[0] == sys.executable
+    assert command[command.index("--attn-implementation") + 1] == "sdpa"
+    assert command[command.index("--dtype") + 1] == "auto"
+    assert float(command[command.index("--max-hours") + 1]) * 3600 < 60
+    assert "--no-resume" in command
+    assert all(options == {"check": True, "timeout": 60} for _, options in commands)
+    assert "--pilot-worker" in commands[2][0]
+
+
+def test_timeout_is_reported(cloud, monkeypatch):
+    work, _, _ = cloud
+
+    def timeout(*args):
+        raise subprocess.TimeoutExpired("stage", 1)
+
+    monkeypatch.setattr(runner, "run_stage", timeout)
+    assert runner.main(["--workdir", str(work)]) == 1
+    assert "TimeoutExpired" in (work / "SUMMARY.md").read_text()
+
+
+@pytest.mark.parametrize("remaining,reserve_minutes", [(7200, 30), (39600, 30), (39600, 180)])
+def test_collection_soft_deadline_reserves_wind_down(monkeypatch, remaining, reserve_minutes):
+    commands = []
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda command, **kw: commands.append((command, kw))
+    )
+    args = runner.parser().parse_args(
+        ["--workdir", ".", "--collect-reserve-minutes", str(reserve_minutes)]
+    )
+    RUN_STAGE("collect", args, remaining)
+    command, options = commands[0]
+    soft_seconds = float(command[command.index("--max-hours") + 1]) * 3600
+    assert remaining - soft_seconds >= reserve_minutes * 60
+    assert remaining - soft_seconds >= remaining * 0.25
+    assert 0 < soft_seconds < remaining
+    assert options["timeout"] == remaining
+
+
+@pytest.mark.parametrize("remaining", [60, 0.5])
+def test_collection_short_budget_has_positive_soft_window(monkeypatch, remaining):
+    commands = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda command, **kw: commands.append(command))
+    args = runner.parser().parse_args(["--workdir", "."])
+    RUN_STAGE("collect", args, remaining)
+    soft_seconds = float(commands[0][commands[0].index("--max-hours") + 1]) * 3600
+    assert soft_seconds == pytest.approx(min(1.0, remaining * 0.1))
+    assert 0 < soft_seconds < remaining
+
+
+def test_collection_can_finish_in_flight_problem_and_run_pilots(cloud, monkeypatch):
+    work, _, _ = cloud
+    now = [0.0]
+    calls = []
+    monkeypatch.setattr(runner.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(runner, "run_stage", RUN_STAGE)
+    args = runner.parser().parse_args(["--workdir", str(work)])
+
+    def subprocess_run(command, *, check, timeout):
+        stage = runner.STAGES[len(calls)]
+        calls.append(stage)
+        if stage == "collect":
+            soft_seconds = float(command[command.index("--max-hours") + 1]) * 3600
+            # Finish a ten-minute problem started just before the soft deadline,
+            # then merge shards. This would exceed the former five-second margin.
+            elapsed = soft_seconds + 600 + 10
+        else:
+            elapsed = 60
+        assert check
+        assert elapsed < timeout
+        now[0] += elapsed
+        for path in runner.stage_outputs(stage, args):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(runner.subprocess, "run", subprocess_run)
+    assert runner.main(["--workdir", str(work), "--max-hours", "11"]) == 0
+    assert calls == list(runner.STAGES)
+    assert "failed" not in (work / "SUMMARY.md").read_text()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--max-hours", "nan"],
+        ["--max-hours", "0"],
+        ["--collect-reserve-minutes", "nan"],
+        ["--collect-reserve-minutes", "inf"],
+        ["--collect-reserve-minutes", "0"],
+        ["--collect-reserve-minutes", "-1"],
+        ["--limit", "0"],
+        ["--stages", "bad"],
+        ["--stages", "collect,collect"],
+        ["--lam", "-1"],
+        ["--n-forced", "0"],
+    ],
+)
+def test_validation(flags):
+    with pytest.raises(SystemExit):
+        runner.main(flags)
+
+
+@pytest.mark.parametrize("name", ["kaggle_run", "colab_run"])
+def test_notebooks(name):
+    notebook = json.loads((ROOT / "notebooks" / f"{name}.ipynb").read_text())
+    assert notebook["nbformat"] == 4
+    assert notebook["nbformat_minor"] >= 0
+    assert isinstance(notebook["metadata"], dict)
+    cells = notebook["cells"]
+    assert any(cell["cell_type"] == "markdown" for cell in cells)
+    assert any(
+        cell["cell_type"] == "code" and "scripts/run_pipeline.py" in "".join(cell["source"])
+        for cell in cells
+    )
+    for cell in cells:
+        assert isinstance(cell["source"], list)
+        assert isinstance(cell["metadata"], dict)
+        if cell["cell_type"] == "code":
+            assert cell["execution_count"] is None
+            assert cell["outputs"] == []
+
+
+def test_pilot_worker_backend_options(monkeypatch):
+    from osc.collect import hf_backend
+
+    captured = []
+    monkeypatch.setattr(hf_backend, "HFBackend", lambda *a, **kw: captured.append((a, kw)))
+    monkeypatch.setattr(sys, "argv", [])
+
+    def script(path, run_name):
+        assert Path(path).name == "pilot_flips.py"
+        assert run_name == "__main__"
+        hf_backend.HFBackend("model")
+
+    monkeypatch.setattr(runner.runpy, "run_path", script)
+    runner.pilot_worker(["flips", "float16", "7", "--model", "model"])
+    assert captured == [
+        (("model",), {"dtype": "float16", "seed": 7, "attn_implementation": "eager"})
+    ]

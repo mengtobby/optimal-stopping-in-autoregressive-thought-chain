@@ -199,3 +199,92 @@ def test_attention_version_guard(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
     with pytest.raises(BackendError, match=r"transformers>=4\.51"):
         HFBackend.__new__(HFBackend).attention_to_span("q", "a", (0, 1), [1])
+
+
+def test_non_eager_attention_rejected(tiny_backend):
+    from osc.collect.hf_backend import BackendError
+
+    tiny_backend.attn_implementation = "sdpa"
+    with pytest.raises(BackendError, match="requires loading.*eager"):
+        tiny_backend.attention_to_span("q", "a", (0, 1), [1])
+
+
+def test_constructor_auto_cpu_and_lazy_digits(tiny_backend, monkeypatch):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from osc.collect.hf_backend import HFBackend
+
+    calls = []
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: tiny_backend.tokenizer)
+
+    def load(*args, **kwargs):
+        calls.append(kwargs)
+        return tiny_backend.model
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load)
+    decode = tiny_backend.tokenizer.decode
+    decoded = []
+
+    def record(*args, **kwargs):
+        decoded.append(args)
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(tiny_backend.tokenizer, "decode", record)
+    backend = HFBackend("tiny", device="cpu", dtype="auto", attn_implementation="sdpa")
+    assert calls[0]["dtype"] == tiny_backend.torch.float32
+    assert calls[0]["attn_implementation"] == "sdpa"
+    assert decoded == []
+    backend.score_continuations("q", "", "", [" 1"])
+    assert len(decoded) == len(backend.tokenizer)
+    backend.score_continuations("q", "", "", [" 1"])
+    assert len(decoded) == len(backend.tokenizer)
+
+
+@pytest.mark.parametrize(
+    "device,capabilities,expected,checked",
+    [
+        ("auto", [(7, 5)], "float16", [0]),
+        ("auto", [(6, 0)], "float16", [0]),
+        ("auto", [(8, 0)], "bfloat16", [0]),
+        ("auto", [(8, 0), (7, 5)], "float16", [0, 1]),
+        ("cuda:1", [(8, 0), (7, 5)], "float16", [1]),
+        ("cuda:0", [(8, 0), (7, 5)], "bfloat16", [0]),
+        ("cuda", [(7, 5)], "float16", [None]),
+    ],
+)
+def test_auto_dtype_uses_native_cuda_capability(
+    monkeypatch, device, capabilities, expected, checked
+):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from osc.collect.hf_backend import HFBackend
+
+    def capability(index):
+        return capabilities[0 if index is None else index]
+
+    cuda = SimpleNamespace(
+        is_available=lambda: True,
+        is_bf16_supported=lambda: True,  # Emulation must not select bf16 on sm75/sm60.
+        device_count=lambda: len(capabilities),
+        get_device_capability=Mock(side_effect=capability),
+    )
+    torch = SimpleNamespace(cuda=cuda, float16="float16", bfloat16="bfloat16")
+    model = Mock()
+    loader = Mock(return_value=model)
+    transformers = SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(
+            from_pretrained=lambda *a, **kw: SimpleNamespace(is_fast=True)
+        ),
+        AutoModelForCausalLM=SimpleNamespace(from_pretrained=loader),
+        set_seed=lambda seed: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    HFBackend("stub", device=device, dtype="auto")
+    assert loader.call_args.kwargs["dtype"] == expected
+    assert loader.call_args.kwargs["device_map"] == ("auto" if device == "auto" else None)
+    assert [call.args[0] for call in cuda.get_device_capability.call_args_list] == checked
+    if device != "auto":
+        model.to.assert_called_once_with(device)

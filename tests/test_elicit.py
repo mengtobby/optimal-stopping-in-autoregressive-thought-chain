@@ -1,7 +1,15 @@
+import json
+import logging
+import runpy
+import sys
+from pathlib import Path
+from types import ModuleType
+
 import numpy as np
 import pytest
 from test_flips import make_trace
 
+from osc.data.io import save_traceset
 from osc.data.schema import TraceSet
 from osc.pilots.elicit import (
     ElicitationError,
@@ -201,7 +209,7 @@ def test_distribution_and_filter():
     assert stats.mean_bias == pytest.approx(-1 / 6)
 
 
-@pytest.mark.parametrize("scores", [[0], [0, np.nan], [0, 0.1], [0, np.inf]])
+@pytest.mark.parametrize("scores", [[0], [0, np.nan], [0, 0.1], [0, 1e-3], [0, np.inf]])
 def test_invalid_distribution_scores(scores):
     with pytest.raises(ElicitationError, match="scores"):
         elicit_remaining_distribution(ScoringBackend(scores), "", make_trace(), max_k=1)
@@ -212,6 +220,57 @@ def test_zero_probability_distribution():
     assert np.isnan(result.expected).all()
     assert np.isnan(result.probs).all()
     np.testing.assert_array_equal(result.mass, 0)
+
+
+@pytest.mark.parametrize("score", [5e-7, 1e-4])
+def test_tiny_positive_scores_are_clamped(score, caplog):
+    with caplog.at_level(logging.DEBUG, logger="osc.pilots.elicit"):
+        result = elicit_remaining_distribution(
+            ScoringBackend([score, -np.inf]), "", make_trace(), max_k=1
+        )
+    np.testing.assert_array_equal(result.mass, 1)
+    np.testing.assert_array_equal(result.expected, 0)
+    np.testing.assert_array_equal(result.probs, np.tile([1, 0], (4, 1)))
+    assert "Clamping tiny positive" in caplog.text
+
+
+@pytest.mark.parametrize("chunk_args,expected", [([], 8), (["--score-chunk-size", "2"], 2)])
+def test_cli_score_chunk_size(chunk_args, expected, tmp_path, monkeypatch):
+    traces = tmp_path / "traces"
+    save_traceset(TraceSet((make_trace(),)), traces)
+    problems = tmp_path / "problems.jsonl"
+    problems.write_text(json.dumps({"problem_id": "p", "prompt": "prompt"}), encoding="utf-8")
+    output = tmp_path / "result.json"
+    calls = []
+
+    class FakeHF(ScoringBackend):
+        def __init__(self, model_name, *, score_chunk_size=8):
+            calls.append((model_name, score_chunk_size))
+            super().__init__(np.full(31, -np.log(31)))
+
+    module = ModuleType("osc.collect.hf_backend")
+    module.HFBackend = FakeHF
+    monkeypatch.setitem(sys.modules, "osc.collect.hf_backend", module)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pilot_elicit.py",
+            "--traces",
+            str(traces),
+            "--problems",
+            str(problems),
+            "--model",
+            "fake-model",
+            "--out",
+            str(output),
+        ]
+        + chunk_args,
+    )
+    namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/pilot_elicit.py"))
+    namespace["main"]()
+    assert calls == [("fake-model", expected)]
+    assert json.loads(output.read_text(encoding="utf-8"))["n_elicitations"] == 4
 
 
 @pytest.mark.parametrize(

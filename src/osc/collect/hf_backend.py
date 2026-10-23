@@ -22,14 +22,39 @@ class HFBackend:
         top_p: float = 0.95,
         seed: int = 0,
         score_chunk_size: int = 8,
+        attn_implementation: str = "eager",
     ) -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
         if temperature < 0 or not 0 < top_p <= 1 or not feature_layers:
             raise BackendError("invalid sampling parameters or empty feature_layers")
-        if dtype not in ("float32", "float16", "bfloat16"):
-            raise BackendError("dtype must be float32, float16, or bfloat16")
+        if dtype not in ("auto", "float32", "float16", "bfloat16"):
+            raise BackendError("dtype must be auto, float32, float16, or bfloat16")
+        if attn_implementation not in ("eager", "sdpa"):
+            raise BackendError("attn_implementation must be eager or sdpa")
+        if dtype == "auto":
+            target = device.split(":", 1)[0]
+            if target == "auto":
+                target = "cuda" if torch.cuda.is_available() else "cpu"
+                if target == "cpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+                    target = "xpu"
+            if target == "cpu":
+                dtype = "float32"
+            else:
+                if target == "cuda":
+                    # Tensor creation can report emulated bf16 support on T4/P100.
+                    # Sharded models must use a dtype suited to every visible GPU.
+                    indices = (
+                        range(torch.cuda.device_count())
+                        if device == "auto"
+                        else [int(device.split(":", 1)[1]) if ":" in device else None]
+                    )
+                    bf16 = all(torch.cuda.get_device_capability(index)[0] >= 8 for index in indices)
+                else:
+                    bf16 = target == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available()
+                dtype = "bfloat16" if bf16 else "float16"
+        self.attn_implementation = attn_implementation
         if score_chunk_size < 1:
             raise BackendError("score_chunk_size must be positive")
         self.score_chunk_size = score_chunk_size
@@ -42,14 +67,13 @@ class HFBackend:
             model_name,
             dtype=getattr(torch, dtype),
             device_map=device if device == "auto" else None,
-            attn_implementation="eager",
+            attn_implementation=attn_implementation,
         )
         if device != "auto":
             self.model.to(device)
         self.model.eval()
         self.feature_layers = tuple(feature_layers)
         self.temperature, self.top_p = temperature, top_p
-        self._digit_token_ids = self._find_digit_token_ids()
 
     def _find_digit_token_ids(self) -> list[int]:
         return [
@@ -84,7 +108,7 @@ class HFBackend:
             if ids[: len(context_ids)] != context_ids:
                 raise BackendError("candidate changes the context token boundary")
             suffixes.append(ids[len(context_ids) :])
-        if require_non_digit_next and not hasattr(self, "_digit_token_ids"):
+        if not hasattr(self, "_digit_token_ids"):
             self._digit_token_ids = self._find_digit_token_ids()
         torch = self.torch
         scores = []
@@ -269,6 +293,10 @@ class HFBackend:
     def attention_to_span(
         self, prompt: str, thinking: str, span: tuple[int, int], query_char_positions: Sequence[int]
     ) -> np.ndarray:
+        if getattr(self, "attn_implementation", "eager") != "eager":
+            raise BackendError(
+                "attention_to_span requires loading with attn_implementation='eager'"
+            )
         # Intercept eager softmax inputs: only selected rows are materialized for the
         # probe, while SDPA computes the full forward output without an attention matrix.
         try:

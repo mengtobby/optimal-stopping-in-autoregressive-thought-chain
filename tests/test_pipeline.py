@@ -229,3 +229,47 @@ def test_ended_thinking_uses_outer_step_boundary(extend):
     assert (sibling.features == trace.features[1]).all()
     assert stats.n_ended_thinking == 2
     assert stats.n_extended == (2 if extend else 0)
+
+
+def test_deadline_and_resume(tmp_path, monkeypatch, caplog):
+    import logging
+
+    import osc.collect.pipeline as pipeline
+
+    clock = [0.0]
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: clock[0])
+
+    class TimedBackend(FakeBackend):
+        def generate_thinking(self, prompt, max_tokens):
+            clock[0] += 10
+            return super().generate_thinking(prompt, max_tokens)
+
+    problems = [Problem(str(i), "q", "1", "test") for i in range(3)]
+    config = CollectConfig(k_siblings=0)
+    with caplog.at_level(logging.INFO):
+        first = collect_dataset(TimedBackend(), problems, config, tmp_path, deadline=5)
+    assert len(first) == 1
+    assert "deadline reached" in caplog.text
+    assert "elapsed=10.00s" in caplog.text
+    assert "steps=" in caplog.text and "natural_stop=" in caplog.text
+    # Cached traces remain available after expiry, including after an uncollected problem.
+    resumed = collect_dataset(
+        FakeBackend(thinking={}), problems[::-1], config, tmp_path, deadline=5
+    )
+    assert len(resumed) == 1
+    assert len(load_traceset(tmp_path / "merged")) == 1
+    assert len(collect_dataset(FakeBackend(), problems, config, tmp_path)) == 3
+
+
+def test_expired_deadline_without_shards(tmp_path, monkeypatch):
+    import osc.collect.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: 10)
+    with pytest.raises(CollectionError, match="no problems"):
+        collect_dataset(
+            FakeBackend(thinking={}),
+            [Problem("a", "q", "1", "test")],
+            CollectConfig(k_siblings=0),
+            tmp_path,
+            deadline=10,
+        )
