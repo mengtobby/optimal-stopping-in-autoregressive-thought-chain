@@ -199,3 +199,42 @@ def test_attention_version_guard(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", types.ModuleType("transformers"))
     with pytest.raises(BackendError, match=r"transformers>=4\.51"):
         HFBackend.__new__(HFBackend).attention_to_span("q", "a", (0, 1), [1])
+
+
+def test_non_eager_attention_rejected(tiny_backend):
+    from osc.collect.hf_backend import BackendError
+
+    tiny_backend.attn_implementation = "sdpa"
+    with pytest.raises(BackendError, match="requires loading.*eager"):
+        tiny_backend.attention_to_span("q", "a", (0, 1), [1])
+
+
+def test_constructor_auto_cpu_and_lazy_digits(tiny_backend, monkeypatch):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from osc.collect.hf_backend import HFBackend
+
+    calls = []
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **kw: tiny_backend.tokenizer)
+
+    def load(*args, **kwargs):
+        calls.append(kwargs)
+        return tiny_backend.model
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load)
+    decode = tiny_backend.tokenizer.decode
+    decoded = []
+
+    def record(*args, **kwargs):
+        decoded.append(args)
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(tiny_backend.tokenizer, "decode", record)
+    backend = HFBackend("tiny", device="cpu", dtype="auto", attn_implementation="sdpa")
+    assert calls[0]["dtype"] == tiny_backend.torch.float32
+    assert calls[0]["attn_implementation"] == "sdpa"
+    assert decoded == []
+    backend.score_continuations("q", "", "", [" 1"])
+    assert len(decoded) == len(backend.tokenizer)
+    backend.score_continuations("q", "", "", [" 1"])
+    assert len(decoded) == len(backend.tokenizer)
