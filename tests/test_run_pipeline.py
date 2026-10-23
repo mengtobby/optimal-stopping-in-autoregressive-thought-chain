@@ -382,6 +382,11 @@ def test_content_changes_invalidate_reports(cloud, change):
 def test_collection_never_shrinks_merged(cloud, monkeypatch, force):
     work, _, _ = cloud
     save_traceset(traces_for("p", "q"), work / "traces/merged")
+    monkeypatch.setattr(
+        runner,
+        "load_math500",
+        lambda: (Problem("p", "question", "1", "test"), Problem("q", "other", "2", "test")),
+    )
 
     def smaller(name, args, remaining):
         save_traceset(traces_for("p"), args.workdir / "traces/merged")
@@ -421,3 +426,33 @@ def test_malformed_problems_write_failure_summary(cloud, content):
     summary = (work / "SUMMARY.md").read_text()
     assert "failed: invalid problems.jsonl" in summary
     assert "Could not read problems.jsonl" in summary
+
+
+@pytest.mark.parametrize("new_id", ["p", "replacement"])
+def test_refresh_keeps_smaller_current_dataset_and_resume_settles(cloud, monkeypatch, new_id):
+    work, calls, _ = cloud
+    monkeypatch.setattr(
+        runner,
+        "load_math500",
+        lambda: (Problem("p", "question", "1", "test"), Problem("q", "other", "2", "test")),
+    )
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    monkeypatch.setattr(
+        runner, "load_math500", lambda: (Problem(new_id, "new question", "3", "test"),)
+    )
+    calls.clear()
+    assert runner.main([*flags, "--stages", "collect", "--refresh-problems", "--force"]) == 0
+    assert [name for name, _ in calls] == ["collect"]
+    assert {trace.problem_id for trace in load_traceset(work / "traces/merged")} == {new_id}
+    backup = next((work / "traces").glob("merged.bak-*"))
+    assert len(load_traceset(backup)) == 2
+    assert not list((work / "traces").glob("merged.partial-*"))
+    assert "restored" not in (work / "SUMMARY.md").read_text()
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == ["headroom", "elicit", "flips"]
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
+    assert list((work / "traces").glob("merged.bak-*")) == [backup]

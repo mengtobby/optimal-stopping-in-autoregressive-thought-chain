@@ -153,9 +153,17 @@ def restore_collection(args: argparse.Namespace, backup: Path | None) -> str:
     if backup is None:
         return ""
     merged = args.workdir / "traces" / "merged"
-    old_count = len(load_traceset(backup))
-    if merged_fingerprint(args.workdir) is not None and len(load_traceset(merged)) >= old_count:
+    expected = problem_ids(args)
+    old_ids = {trace.problem_id for trace in load_traceset(backup)}
+    # A refreshed problem list can deliberately replace or reduce the dataset.
+    # Restoring traces outside that list would leave pilots without their prompts.
+    if not old_ids <= expected:
         return ""
+    old_count = len(old_ids)
+    if merged_fingerprint(args.workdir) is not None:
+        new_ids = {trace.problem_id for trace in load_traceset(merged)}
+        if len(new_ids & expected) >= old_count:
+            return ""
     partial = dated_path(merged, "partial")
     if merged.exists():
         merged.rename(partial)
