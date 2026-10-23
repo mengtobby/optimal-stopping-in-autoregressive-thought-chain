@@ -37,6 +37,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dataset", choices=("math500", "gsm8k"), default="math500")
     result.add_argument("--limit", type=int)
     result.add_argument("--max-hours", type=float, default=11)
+    result.add_argument(
+        "--collect-reserve-minutes",
+        type=float,
+        default=30,
+        help="minimum time reserved after collection's soft deadline (default: 30 minutes)",
+    )
     result.add_argument("--stages", default=",".join(STAGES))
     result.add_argument("--lam", type=float, nargs="+", default=[0.0, 0.05, 0.1])
     result.add_argument(
@@ -67,6 +73,10 @@ def run_stage(stage: str, args: argparse.Namespace, remaining: float) -> None:
     """Use a child process so a scoring call cannot overrun the total budget."""
     traces = str(args.workdir / "traces" / "merged")
     if stage == "collect":
+        # Stop starting problems well before the hard timeout: the last problem
+        # must finish and shards must merge before downstream stages can run.
+        reserve = max(args.collect_reserve_minutes * 60, remaining * 0.25)
+        soft_seconds = max(min(1.0, remaining * 0.1), remaining - reserve)
         command = [
             sys.executable,
             str(ROOT / "scripts" / "collect.py"),
@@ -85,7 +95,7 @@ def run_stage(stage: str, args: argparse.Namespace, remaining: float) -> None:
             "--seed",
             str(args.seed),
             "--max-hours",
-            str(max(remaining - 5, remaining * 0.9) / 3600),
+            str(soft_seconds / 3600),
         ]
         for name in CONFIG_FLAGS:
             command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
@@ -174,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     args = cli.parse_args(argv)
     if not math.isfinite(args.max_hours) or args.max_hours <= 0:
         cli.error("--max-hours must be finite and positive")
+    if not math.isfinite(args.collect_reserve_minutes) or args.collect_reserve_minutes <= 0:
+        cli.error("--collect-reserve-minutes must be finite and positive")
     if args.limit is not None and args.limit < 1:
         cli.error("--limit must be positive")
     if any(not math.isfinite(lam) or lam < 0 for lam in args.lam):
