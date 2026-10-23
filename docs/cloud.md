@@ -106,14 +106,18 @@ when content changes, even at equal trace counts; unchanged reports are skipped.
 Legacy sidecars without fingerprints are stale. Sidecars are excluded from
 `SUMMARY.md` and `results.zip`.
 
-Before collection, readable merged data is copied to `traces/merged.bak-<timestamp>`.
+Before collection, readable merged data is copied to `traces/merged.bak-<timestamp>`
+only when it contains more current-problem traces than there are completed current
+shards, or collection is forced. Ordinary resumes create no backup.
 This protects workdirs whose shards are missing or incomplete. If the backup IDs
 all belong to the current problem list and collection produces fewer expected
 problems or invalid merged data, the runner restores the backup,
-preserves the new output in `traces/merged.partial-<timestamp>`, and records the
+preserves any existing new output in `traces/merged.partial-<timestamp>`, and records the
 recovery in `SUMMARY.md`. A refreshed list that removes or replaces old IDs
 keeps its new merged dataset rather than restoring traces outside that list.
-Backups are retained.
+After successful collection, the oldest saved directories are removed, retaining
+at most `--keep-backups` (default 1) backups and partial outputs each. Use 0 to
+remove all saved copies after success; failed collection retains recovery copies.
 
 `problems.jsonl` is retained, including with `--force`, to keep prompts paired with
 existing traces. `--force` reruns selected stages; for collection it disables shard
