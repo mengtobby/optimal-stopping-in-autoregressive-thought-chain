@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -23,6 +24,15 @@ def cloud(monkeypatch, tmp_path):
 
     def stage(name, args, remaining):
         calls.append((name, remaining))
+        if name == "collect":
+            for line in (args.workdir / "problems.jsonl").read_text().splitlines():
+                problem_id = json.loads(line)["problem_id"]
+                shard = (
+                    args.workdir / "traces/shards" / hashlib.sha256(problem_id.encode()).hexdigest()
+                )
+                shard.mkdir(parents=True, exist_ok=True)
+                for filename in ("metadata.json", "traces.jsonl", "arrays.npz"):
+                    (shard / filename).write_text("{}")
         for path in runner.stage_outputs(name, args):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"headroom": 0.25, "n_flip": 2}), encoding="utf-8")
@@ -88,7 +98,9 @@ def test_subprocess_timeout_and_collection_options(cloud, monkeypatch):
     monkeypatch.setattr(
         runner.subprocess, "run", lambda command, **kw: commands.append((command, kw))
     )
-    args = runner.parser().parse_args(["--workdir", str(work), "--force"])
+    args = runner.parser().parse_args(
+        ["--workdir", str(work), "--force", "--score-chunk-size", "3"]
+    )
     for name in runner.STAGES:
         RUN_STAGE(name, args, 60)
     command, options = commands[0]
@@ -99,6 +111,7 @@ def test_subprocess_timeout_and_collection_options(cloud, monkeypatch):
     assert "--no-resume" in command
     assert all(options == {"check": True, "timeout": 60} for _, options in commands)
     assert "--pilot-worker" in commands[2][0]
+    assert commands[2][0][-2:] == ["--score-chunk-size", "3"]
 
 
 def test_timeout_is_reported(cloud, monkeypatch):
@@ -213,7 +226,8 @@ def test_notebooks(name):
             assert cell["outputs"] == []
 
 
-def test_pilot_worker_backend_options(monkeypatch):
+@pytest.mark.parametrize("stage,attention", [("elicit", "sdpa"), ("flips", "eager")])
+def test_pilot_worker_backend_options(monkeypatch, stage, attention):
     from osc.collect import hf_backend
 
     captured = []
@@ -221,12 +235,61 @@ def test_pilot_worker_backend_options(monkeypatch):
     monkeypatch.setattr(sys, "argv", [])
 
     def script(path, run_name):
-        assert Path(path).name == "pilot_flips.py"
+        assert Path(path).name == f"pilot_{stage}.py"
         assert run_name == "__main__"
-        hf_backend.HFBackend("model")
+        hf_backend.HFBackend("model", "cpu", score_chunk_size=3, temperature=0.2)
 
     monkeypatch.setattr(runner.runpy, "run_path", script)
-    runner.pilot_worker(["flips", "float16", "7", "--model", "model"])
+    runner.pilot_worker([stage, "float16", "7", "--model", "model"])
     assert captured == [
-        (("model",), {"dtype": "float16", "seed": 7, "attn_implementation": "eager"})
+        (
+            ("model", "cpu"),
+            {
+                "dtype": "float16",
+                "seed": 7,
+                "attn_implementation": attention,
+                "score_chunk_size": 3,
+                "temperature": 0.2,
+            },
+        )
     ]
+
+
+def test_partial_shards_recollect_and_reports_follow_growth(cloud):
+    work, calls, _ = cloud
+    flags = ["--workdir", str(work)]
+    assert runner.main(flags) == 0
+    calls.clear()
+    # Add a pending problem while keeping the previous merged subset and reports.
+    with (work / "problems.jsonl").open("a") as stream:
+        stream.write(json.dumps({"problem_id": "pending"}) + "\n")
+    assert runner.main([*flags, "--stages", "collect"]) == 0
+    assert [name for name, _ in calls] == ["collect"]
+    assert "Collected 2 of 2 problems" in (work / "SUMMARY.md").read_text()
+    calls.clear()
+    with (work / "traces/merged/traces.jsonl").open("a") as stream:
+        stream.write('\n{"problem_id": "pending"}\n')
+    assert runner.main(flags) == 0
+    assert [name for name, _ in calls] == ["headroom", "elicit", "flips"]
+    calls.clear()
+    assert runner.main(flags) == 0
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "stages,refresh,changed",
+    [("collect", False, False), ("elicit", True, False), ("collect", True, True)],
+)
+def test_force_preserves_problems_unless_explicitly_refreshed(
+    cloud, monkeypatch, stages, refresh, changed
+):
+    work, _, _ = cloud
+    assert runner.main(["--workdir", str(work)]) == 0
+    path = work / "problems.jsonl"
+    original = path.read_bytes()
+    monkeypatch.setattr(runner, "load_math500", lambda: (Problem("new", "other", "2", "test"),))
+    flags = ["--workdir", str(work), "--stages", stages, "--force"]
+    if refresh:
+        flags.append("--refresh-problems")
+    assert runner.main(flags) == 0
+    assert (path.read_bytes() != original) == changed
