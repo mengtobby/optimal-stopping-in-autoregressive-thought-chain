@@ -1,5 +1,6 @@
 """Optional Transformers backend; model dependencies are imported only on construction."""
 
+import logging
 from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
@@ -37,7 +38,12 @@ class HFBackend:
             target = device.split(":", 1)[0]
             if target == "auto":
                 target = "cuda" if torch.cuda.is_available() else "cpu"
-                if target == "cpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+                if target == "cuda" and torch.cuda.device_count() == 0:
+                    logging.getLogger(__name__).warning(
+                        "CUDA reports available but no devices were enumerated; using float32"
+                    )
+                    target = "cpu"
+                elif target == "cpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
                     target = "xpu"
             if target == "cpu":
                 dtype = "float32"

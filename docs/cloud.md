@@ -64,8 +64,9 @@ python scripts/run_pipeline.py --workdir /kaggle/working/osc-runs/math500 \
   --max-thinking-tokens 2048 --max-steps 16
 ```
 
-Order is collect, headroom, elicit, flips. Generation uses SDPA; pilot processes
-load their own backend with eager attention and the requested dtype. `auto`
+Order is collect, headroom, elicit, flips. Collection and elicitation use SDPA; only the flips pilot loads eager attention
+for attention probes. Each backend uses the requested dtype. Use
+`--score-chunk-size` (default 8) to tune elicitation candidate batch size. `auto`
 selects a suitable dtype through HFBackend; notebooks explicitly use float16 for
 T4/P100. Headroom defaults to lambda 0, 0.05, 0.1 (`--lam` accepts a list).
 
@@ -93,17 +94,21 @@ A nonzero exit status means at least one stage failed or ran out of time.
 
 ## Resume and retrieve results
 
-Rerun the same command and workdir: existing stage outputs are skipped. Collection
-requires all three merged trace files; reports require all requested lambda JSON
-files. Interrupted collection reuses completed `traces/shards` when merged output
-is absent. `problems.jsonl` is retained to keep pilot prompts identical.
+Rerun the same command or notebook with the same workdir. Collection resumes from
+completed `traces/shards` until every ID in `problems.jsonl` has a shard, even when
+`traces/merged` already contains a subset. No deletion or manual cleanup is needed.
+`SUMMARY.md` reports collected X of Y problems. Reports record their merged trace
+count in `.resume.json` sidecars and rerun automatically when that count changes;
+unchanged reports are skipped. Reports without sidecars are regenerated once.
 
-A soft deadline can produce a merged subset. To continue collecting that subset,
-remove only `traces/merged` and rerun `--stages collect` with the same workdir;
-keep `traces/shards`. Then regenerate downstream reports with
-`--stages headroom,elicit,flips --force`. `--force` reruns selected stages;
-for collection it disables shard reuse. Use a fresh workdir when changing model,
-dataset, problem limit, seed, or collection settings to avoid mixing experiments.
+`problems.jsonl` is retained, including with `--force`, to keep prompts paired with
+existing traces. `--force` reruns selected stages; for collection it disables shard
+reuse. To regenerate reports explicitly, use
+`--stages headroom,elicit,flips --force`. To replace the saved problem list, select
+collection and pass `--refresh-problems` (normally together with `--force` to
+recollect). This flag has no effect when collection is not selected. Use a fresh
+workdir when changing model, dataset, problem limit, seed, or collection settings
+to avoid mixing experiments.
 
 On Kaggle, attach a previous version's output as an input dataset, then copy its
 **entire workdir** from the read-only `/kaggle/input/...` into `/kaggle/working/...`
