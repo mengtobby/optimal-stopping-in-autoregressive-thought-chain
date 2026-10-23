@@ -96,7 +96,9 @@ A nonzero exit status means at least one stage failed or ran out of time.
 
 Rerun the same command or notebook with the same workdir. Collection resumes from
 completed `traces/shards` until every ID in `problems.jsonl` has a shard, even when
-`traces/merged` already contains a subset. No deletion or manual cleanup is needed.
+`traces/merged` already contains a subset. The runner also validates that the merged
+trace set is readable and contains every expected ID; an interrupted or stale merge
+is rebuilt from the completed shards. No deletion or manual cleanup is needed.
 `SUMMARY.md` reports collected X of Y problems. Reports record their merged trace
 count in `.resume.json` sidecars and rerun automatically when that count changes;
 unchanged reports are skipped. Reports without sidecars are regenerated once.

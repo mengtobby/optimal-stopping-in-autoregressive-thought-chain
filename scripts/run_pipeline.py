@@ -17,6 +17,7 @@ from pathlib import Path
 
 from osc.collect.datasets import load_gsm8k, load_math500, save_jsonl
 from osc.collect.pipeline import CollectConfig
+from osc.data.io import load_traceset
 
 LOGGER = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,11 +73,11 @@ def stage_outputs(stage: str, args: argparse.Namespace) -> list[Path]:
     return [args.workdir / "results" / f"pilot_{stage}.json"]
 
 
-def collection_progress(args: argparse.Namespace) -> tuple[int, int]:
-    """Count expected problem IDs with committed shards, excluding temporary shards."""
+def problem_ids(args: argparse.Namespace) -> set[str]:
+    """Read the expected IDs independently of collection and merged output."""
     path = args.workdir / "problems.jsonl"
     if not path.exists():
-        return 0, 0
+        return set()
     ids = set()
     with path.open(encoding="utf-8") as stream:
         for line in stream:
@@ -85,6 +86,12 @@ def collection_progress(args: argparse.Namespace) -> tuple[int, int]:
                 if not isinstance(problem_id, str) or not problem_id:
                     raise ValueError("problem_id must be a nonempty string")
                 ids.add(problem_id)
+    return ids
+
+
+def collection_progress(args: argparse.Namespace) -> tuple[int, int]:
+    """Count expected problem IDs with committed shards, excluding temporary shards."""
+    ids = problem_ids(args)
     collected = 0
     for problem_id in ids:
         shard = args.workdir / "traces" / "shards" / hashlib.sha256(problem_id.encode()).hexdigest()
@@ -113,7 +120,27 @@ def stage_complete(stage: str, args: argparse.Namespace) -> bool:
         return False
     if stage == "collect":
         collected, total = collection_progress(args)
-        return collected == total
+        if collected != total:
+            return False
+        try:
+            # Loading validates JSON, array keys/shapes, and the NPZ archive. A kill
+            # during save can leave new JSON beside an old or truncated archive.
+            merged = load_traceset(args.workdir / "traces" / "merged")
+            return len(merged) == total and {trace.problem_id for trace in merged} == problem_ids(
+                args
+            )
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            IndexError,
+            EOFError,
+            zipfile.BadZipFile,
+        ):
+            LOGGER.warning("Merged traces are incomplete or invalid; re-merging from shards")
+            return False
     count = trace_count(args)
     for output in outputs:
         try:
