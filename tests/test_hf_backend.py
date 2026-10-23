@@ -49,13 +49,14 @@ def test_tiny_model_features_and_attention(tiny_backend):
 
 
 @pytest.mark.parametrize("non_digit", [False, True])
-def test_score_continuations_matches_manual(tiny_backend, non_digit):
+def test_score_continuations_matches_manual(tiny_backend, non_digit, monkeypatch):
     import numpy as np
 
     backend = tiny_backend
     torch = backend.torch
     candidates = [" 1", " 12", " a b", ""] * 3
-    context = backend._prompt("q") + "a "
+    thinking = "a " * 32 + "a"
+    context = backend._prompt("q") + thinking + " "
     expected = []
     for candidate in candidates:
         encoded = backend.tokenizer(
@@ -77,10 +78,58 @@ def test_score_continuations_matches_manual(tiny_backend, non_digit):
             p_digit = log_probs[-1, digit_ids].exp().sum()
             score += float(torch.log1p(-p_digit))
         expected.append(score)
-    actual = backend.score_continuations("q", "a", " ", candidates, non_digit)
+    calls = []
+    forward = backend.model.forward
+
+    def record_forward(**kwargs):
+        calls.append(
+            (
+                tuple(kwargs["input_ids"].shape),
+                kwargs.get("logits_to_keep"),
+                kwargs.get("past_key_values").get_seq_length()
+                if kwargs.get("past_key_values") is not None
+                else 0,
+            )
+        )
+        assert kwargs["use_cache"] is True
+        assert backend.model.config._attn_implementation == "sdpa"
+        return forward(**kwargs)
+
+    monkeypatch.setattr(backend.model, "forward", record_forward)
+    actual = backend.score_continuations("q", thinking, " ", candidates, non_digit)
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+    context_length = len(backend.tokenizer.encode(context, add_special_tokens=False))
+    assert calls == [
+        ((1, context_length), 1, 0),
+        ((8, 2), None, context_length),
+        ((4, 2), None, context_length),
+    ]
+    assert backend.model.config._attn_implementation == "eager"
     assert backend._find_digit_token_ids() == [4, 5]
     assert backend.score_continuations("q", "", "", []).shape == (0,)
+
+
+def test_score_rejects_changed_context_ids(tiny_backend, monkeypatch):
+    from osc.collect.hf_backend import BackendError
+
+    monkeypatch.setattr(tiny_backend.tokenizer, "encode", lambda *args, **kwargs: [2])
+    with pytest.raises(BackendError, match="changes the context"):
+        tiny_backend.score_continuations("q", "", "", [" 1"])
+
+
+def test_score_empty_suffixes_and_attention_restoration(tiny_backend, monkeypatch):
+    import numpy as np
+
+    backend = tiny_backend
+    np.testing.assert_array_equal(backend.score_continuations("q", "", "", ["", ""]), [0, 0])
+
+    def fail(**kwargs):
+        raise RuntimeError("prefill failed")
+
+    monkeypatch.setattr(backend.model, "forward", fail)
+    with pytest.raises(RuntimeError, match="prefill failed"):
+        backend.score_continuations("q", "", "", [" 1"])
+    assert backend.model.config._attn_implementation == "eager"
 
 
 def test_score_boundary_and_digit_penalty(tiny_backend):
