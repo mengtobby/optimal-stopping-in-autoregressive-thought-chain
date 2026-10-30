@@ -13,19 +13,20 @@ only uploads notebooks and downloads reports. Python 3.11 or newer is required.
    **GPU T4 x2**. P100 also works when available. Run the `nvidia-smi` cell to
    confirm a cloud GPU; stop if it fails. The notebook uses one GPU for the 1.5B
    model, so it does not assume that two T4s form a single larger device.
-4. Review the workdir `/kaggle/working/osc-runs/math500`. The setup clones the
+4. Review the workdir `/kaggle/working/osc-runs/math500-r2`. The setup clones the
    public repository and installs `pip install -e '.[model]'` on the cloud VM.
 5. Select **Save Version > Save & Run All (Commit)** to execute every cell in a
    fresh background session. You can close the browser after starting the commit.
    Files created only in an earlier interactive session are not automatically
    copied into that fresh session.
-6. The defaults use the 1.5B model, math500, 100 problems, an 11-hour total budget,
-   float16, and reduced sampling/token limits. Check your account's current
+6. The defaults use the 1.5B model, math500, 60 problems, an 11-hour total budget,
+   float16, 2 forced answers, 4 siblings every 2nd step (128 tokens each),
+   a 3072-token thinking budget, and at most 20 steps. Check your account's current
    session limit first: some sessions allow 12 hours, while Kaggle's GPU tips
    currently describe 9-hour sessions. Lower `--max-hours` below the displayed
    limit (for example 8) when needed. Reserve time for installation and downloads.
 7. After completion, open the saved version's **Output** files and download
-   `osc-runs/math500/results.zip`. Also preserve the full workdir to resume traces.
+   `osc-runs/math500-r2/results.zip`. Also preserve the full workdir to resume traces.
    The notebook displays `SUMMARY.md`, including failed or budget-skipped stages.
 
 Kaggle generally provides about **30 GPU-hours per week**, subject to account
@@ -39,11 +40,11 @@ and [GPU quota tips](https://www.kaggle.com/page/GPU-tips-and-tricks).
 2. Select **Runtime > Change runtime type > T4 GPU** (subject to availability).
    Run `nvidia-smi`; do not continue with a local runtime or CPU runtime.
 3. Set `USE_DRIVE = True` in the persistence cell to mount Google Drive and use
-   `/content/drive/MyDrive/osc-runs/math500`. Approve the Drive mount in Colab.
-   With `False`, outputs live under `/content/osc-runs/math500` and disappear
+   `/content/drive/MyDrive/osc-runs/math500-r2`. Approve the Drive mount in Colab.
+   With `False`, outputs live under `/content/osc-runs/math500-r2` and disappear
    when the VM is reclaimed. Mounting Drive initially requires interaction.
-4. Run all cells. The defaults use 30 math500 problems and a 3-hour budget with
-   the same small model and float16 settings.
+4. Run all cells. The defaults use 20 math500 problems and a 3-hour budget with
+   the same model, float16, sibling, thinking-token, and step settings as Kaggle.
 5. Read the summary and download `results.zip` from the Files sidebar or Drive.
    Retain the full Drive workdir for resume.
 
@@ -57,11 +58,11 @@ interruptions. See the official [Colab FAQ](https://research.google.com/colabora
 The notebook command is equivalent to this command **inside the cloud VM**:
 
 ```bash
-python scripts/run_pipeline.py --workdir /kaggle/working/osc-runs/math500 \
+python scripts/run_pipeline.py --workdir /kaggle/working/osc-runs/math500-r2 \
   --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --dataset math500 \
-  --limit 100 --max-hours 11 --dtype float16 \
-  --n-forced 2 --k-siblings 2 --sibling-stride 4 --sibling-max-tokens 128 \
-  --max-thinking-tokens 2048 --max-steps 16
+  --limit 60 --max-hours 11 --dtype float16 \
+  --n-forced 2 --k-siblings 4 --sibling-stride 2 --sibling-max-tokens 128 \
+  --max-thinking-tokens 3072 --max-steps 20
 ```
 
 Order is collect, headroom, elicit, flips. Collection and elicitation use SDPA; only the flips pilot loads eager attention
@@ -91,6 +92,14 @@ are attempted after failures while time remains. If collection consumes the
 budget, pilots wait for a later invocation; free sessions cannot promise that all
 stages finish in one run. Setup time before the runner is outside its budget.
 A nonzero exit status means at least one stage failed or ran out of time.
+
+## Run 2 rationale
+
+Run 1 (k=2 every 4th step, 2048 tokens) gave vacuous dual bounds and
+censored 83/97 elicitation traces. Run 2 trades problem count for 4 siblings
+every 2nd step and a 3072-token thinking budget. The collector's deadline stops
+starting problems at ~8.25 h, so fewer than 60 may finish, which is expected.
+The fresh `math500-r2` workdirs keep these settings separate from run 1.
 
 ## Resume and retrieve results
 
@@ -140,3 +149,6 @@ Download the archive, extract it under your local repository's `results/`
 (which is gitignored), for example `results/cloud-math500/`. No local model
 execution is needed. Copy `SUMMARY.md` into `docs/` if you want a versioned report;
 review its experiment settings and status before sharing it.
+
+A first-run workdir can be fetched with
+`kaggle kernels output <owner>/<kernel> -p results/<name> --file-pattern osc-runs`.
