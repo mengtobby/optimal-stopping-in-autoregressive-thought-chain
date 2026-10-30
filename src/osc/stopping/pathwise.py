@@ -14,7 +14,14 @@ from scipy.sparse import coo_matrix, csr_matrix, hstack
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from osc.stopping.dual import DualResult, ValueFn, martingale_increments
+from osc.stopping.dual import (
+    DualError,
+    DualResult,
+    ValueFn,
+    _inner_assignments,
+    _validate_folds,
+    martingale_increments,
+)
 from osc.stopping.payoff import PayoffPanel
 
 
@@ -26,8 +33,10 @@ class PathwiseError(ValueError):
 class PathwiseConfig:
     n_components: int | None = 8
     n_time_bins: int = 4
-    beta_bound: float = 10.0
+    beta_bound: float = 1.0
     include_tokens: bool = True
+    l1_penalties: tuple[float, ...] = (0.0, 0.01, 0.03, 0.1, 0.3, 1.0)
+    inner_folds: int = 3
 
     def __post_init__(self) -> None:
         if self.n_components is not None and (
@@ -44,6 +53,14 @@ class PathwiseConfig:
             raise PathwiseError("n_time_bins must be a positive integer")
         if not np.isfinite(self.beta_bound) or self.beta_bound <= 0:
             raise PathwiseError("beta_bound must be finite and positive")
+        if not self.l1_penalties or any(not np.isfinite(p) or p < 0 for p in self.l1_penalties):
+            raise PathwiseError("l1_penalties must contain finite non-negative penalties")
+        if (
+            isinstance(self.inner_folds, bool)
+            or not isinstance(self.inner_folds, (int, np.integer))
+            or self.inner_folds < 2
+        ):
+            raise PathwiseError("inner_folds must be an integer at least 2")
         if not isinstance(self.include_tokens, bool):
             raise PathwiseError("include_tokens must be boolean")
 
@@ -159,26 +176,39 @@ def fit_pathwise_beta(
     panel_train: PayoffPanel,
     basis: PathwiseBasis,
     config: PathwiseConfig = _DEFAULT_CONFIG,
+    l1_penalty: float = 0.0,
 ) -> np.ndarray:
-    """Minimize the optimistic training max-payoff objective with a sparse LP."""
+    """Minimize mean training max-payoff plus an L1 penalty using a sparse LP."""
+    if not np.isfinite(l1_penalty) or l1_penalty < 0:
+        raise PathwiseError("l1_penalty must be finite and non-negative")
     j = len(basis.value_fns)
     if not j:
         return np.empty(0)
-    martingales = basis_martingales(panel_train, basis)
+    return _fit_beta(panel_train, basis_martingales(panel_train, basis), config, l1_penalty)
+
+
+def _fit_beta(
+    panel_train: PayoffPanel,
+    martingales: np.ndarray,
+    config: PathwiseConfig,
+    l1_penalty: float,
+) -> np.ndarray:
+    j = len(martingales)
     rows, times = np.nonzero(panel_train.alive)
     n, constraints = panel_train.n_traces, len(rows)
     u = coo_matrix((-np.ones(constraints), (np.arange(constraints), rows)), (constraints, n))
-    matrix = hstack((u, csr_matrix(-martingales[:, rows, times].T)), format="csr")
+    m = csr_matrix(martingales[:, rows, times].T)
+    matrix = hstack((u, -m, m), format="csr")
     result = linprog(
-        np.r_[np.full(n, 1 / n), np.zeros(j)],
+        np.r_[np.full(n, 1 / n), np.full(2 * j, l1_penalty)],
         A_ub=matrix,
         b_ub=-panel_train.payoff[rows, times],
-        bounds=[(None, None)] * n + [(-config.beta_bound, config.beta_bound)] * j,
+        bounds=[(None, None)] * n + [(0, config.beta_bound)] * (2 * j),
         method="highs",
     )
     if not result.success or result.x is None or not np.all(np.isfinite(result.x)):
         raise PathwiseError(f"pathwise LP failed: {result.message}")
-    return np.asarray(result.x[n:]).copy()
+    return np.asarray(result.x[n : n + j] - result.x[n + j :]).copy()
 
 
 def _result(panel: PayoffPanel, values: np.ndarray, absolute_increments: float) -> DualResult:
@@ -216,19 +246,10 @@ def cross_fit_pathwise_dual(
     Problem groups must stay within a fold. Only out-of-fold objectives are
     reported because optimizing the in-sample objective is optimistic.
     """
-    folds = np.asarray(folds)
-    k = len(anchors_by_fold)
-    if (
-        folds.shape != (panel.n_traces,)
-        or folds.dtype.kind not in "iu"
-        or k < 2
-        or not np.array_equal(np.unique(folds), np.arange(k))
-    ):
-        raise PathwiseError("folds must assign every trace to contiguous nonempty folds 0..K-1")
-    groups: dict[str, int] = {}
-    for trace, fold in zip(panel.traces, folds, strict=True):
-        if groups.setdefault(trace.problem_id, int(fold)) != fold:
-            raise PathwiseError("all traces from a problem must share a fold")
+    try:
+        folds = _validate_folds(panel, folds, len(anchors_by_fold))
+    except DualError as exc:
+        raise PathwiseError(str(exc)) from exc
     values, betas = np.empty(panel.n_traces), []
     absolute_increments = 0.0
     for fold, anchors in enumerate(anchors_by_fold):
@@ -236,7 +257,25 @@ def cross_fit_pathwise_dual(
         indices = np.flatnonzero(folds == fold)
         test = panel.subset(indices)
         basis = build_basis(train, anchors, config)
-        beta = fit_pathwise_beta(train, basis, config)
+        inner = _inner_assignments(train, config.inner_folds, seed=fold)
+        penalties = sorted(set(config.l1_penalties))
+        penalty = max(penalties)
+        if inner is not None and len(penalties) > 1 and basis.value_fns:
+            scores = np.zeros(len(penalties))
+            martingales = basis_martingales(train, basis)
+            for g in range(config.inner_folds):
+                train_indices = np.flatnonzero(inner != g)
+                validation_indices = np.flatnonzero(inner == g)
+                inner_train = train.subset(train_indices)
+                validation = train.subset(validation_indices)
+                for j, candidate in enumerate(penalties):
+                    beta = _fit_beta(inner_train, martingales[:, train_indices], config, candidate)
+                    m = np.einsum("j,jnt->nt", beta, martingales[:, validation_indices])
+                    scores[j] += np.nanmax(
+                        validation.payoff - m[:, : validation.t_max], axis=1
+                    ).sum()
+            penalty = penalties[int(np.argmin(scores))]
+        beta = fit_pathwise_beta(train, basis, config, penalty)
         result = pathwise_dual(test, basis, beta)
         values[indices] = result.per_trace
         absolute_increments += result.mean_abs_increment * np.sum(test.horizons - 1)
