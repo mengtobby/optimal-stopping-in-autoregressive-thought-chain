@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import inf
 
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
-from osc.stopping.payoff import PayoffPanel
+from osc.stopping.payoff import PayoffPanel, evaluate_stop_times
 
 
 class LSMError(ValueError):
@@ -21,6 +22,9 @@ class LSMConfig:
     n_components: int | None = 32
     ridge_alpha: float = 1.0
     min_samples: int = 20
+    margins: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, inf)
+    ridge_alphas: tuple[float, ...] = (1.0, 10.0, 100.0)
+    inner_folds: int = 3
 
     def __post_init__(self) -> None:
         if self.n_components is not None and (
@@ -31,6 +35,12 @@ class LSMConfig:
             raise LSMError("ridge_alpha must be finite and non-negative")
         if not isinstance(self.min_samples, int) or self.min_samples < 1:
             raise LSMError("min_samples must be a positive integer")
+        if not self.margins or any(np.isnan(m) or m < 0 for m in self.margins):
+            raise LSMError("margins must be non-empty and non-negative (infinity is allowed)")
+        if not self.ridge_alphas or any(not np.isfinite(a) or a < 0 for a in self.ridge_alphas):
+            raise LSMError("ridge_alphas must be non-empty, finite and non-negative")
+        if not isinstance(self.inner_folds, int) or self.inner_folds < 2:
+            raise LSMError("inner_folds must be an integer >= 2")
 
 
 @dataclass(frozen=True)
@@ -43,6 +53,7 @@ class LSMPolicy:
     t_max_train: int
     lam: float
     token_scale: float
+    margin: float = 0.0
 
     def _basis(self, t: int, features: np.ndarray, cum_tokens: np.ndarray) -> np.ndarray:
         if not isinstance(t, (int, np.integer)) or t < 0:
@@ -90,10 +101,14 @@ class LSMPolicy:
 
     def stop_times(self, panel: PayoffPanel) -> np.ndarray:
         taus = panel.horizons.copy() - 1
+        if self.margin == inf:
+            return taus
         for t in range(panel.t_max - 1):
             rows = np.flatnonzero((taus > t) & (panel.horizons > t + 1))
             x, tokens = panel.features[rows, t], panel.cum_tokens[rows, t]
-            stop = self.payoff_estimate(t, x, tokens) >= self.continuation(t, x, tokens)
+            stop = self.payoff_estimate(t, x, tokens) >= (
+                self.continuation(t, x, tokens) + self.margin
+            )
             taus[rows[stop]] = t
         return taus
 
@@ -156,21 +171,47 @@ def fit_lsm(panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG) -> LSMPolic
     )
 
 
-def cross_fit_lsm(
-    panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG, n_folds: int = 5, seed: int = 0
-) -> tuple[np.ndarray, tuple[LSMPolicy, ...], np.ndarray]:
-    """Return held-out stop times, fold policies, and each trace's fold index."""
+def _problem_folds(panel: PayoffPanel, n_folds: int, seed: int) -> np.ndarray:
     problem_ids = [trace.problem_id for trace in panel.traces]
     unique_ids = list(dict.fromkeys(problem_ids))
     if not isinstance(n_folds, int) or not 2 <= n_folds <= len(unique_ids):
         raise LSMError("n_folds must be an integer between 2 and the number of problems")
     permutation = np.random.default_rng(seed).permutation(len(unique_ids))
     assignments = {unique_ids[index]: rank % n_folds for rank, index in enumerate(permutation)}
-    folds = np.array([assignments[problem_id] for problem_id in problem_ids], dtype=np.int64)
+    return np.array([assignments[problem_id] for problem_id in problem_ids], dtype=np.int64)
+
+
+def select_lsm_hyperparams(
+    panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG, seed: int = 0
+) -> tuple[float, float]:
+    """Select alpha and stopping margin using only problem-grouped inner held-out paths."""
+    if len({trace.problem_id for trace in panel.traces}) < config.inner_folds:
+        return config.ridge_alpha, inf
+    folds = _problem_folds(panel, config.inner_folds, seed)
+    scores = {(alpha, margin): 0.0 for alpha in config.ridge_alphas for margin in config.margins}
+    for fold in range(config.inner_folds):
+        train = panel.subset(np.flatnonzero(folds != fold))
+        held_out = panel.subset(np.flatnonzero(folds == fold))
+        for alpha in config.ridge_alphas:
+            policy = fit_lsm(train, replace(config, ridge_alpha=alpha))
+            for margin in config.margins:
+                candidate = replace(policy, margin=margin)
+                result = evaluate_stop_times(held_out, candidate.stop_times(held_out), "lsm")
+                scores[alpha, margin] += result.value * held_out.n_traces / panel.n_traces
+    return max(scores, key=lambda pair: (scores[pair], pair[1], pair[0]))
+
+
+def cross_fit_lsm(
+    panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG, n_folds: int = 5, seed: int = 0
+) -> tuple[np.ndarray, tuple[LSMPolicy, ...], np.ndarray]:
+    """Return held-out stop times and policies tuned solely on each outer training fold."""
+    folds = _problem_folds(panel, n_folds, seed)
     taus = np.empty(panel.n_traces, dtype=np.int64)
     policies = []
     for fold in range(n_folds):
-        policy = fit_lsm(panel.subset(np.flatnonzero(folds != fold)), config)
+        train = panel.subset(np.flatnonzero(folds != fold))
+        alpha, margin = select_lsm_hyperparams(train, config, seed + fold)
+        policy = replace(fit_lsm(train, replace(config, ridge_alpha=alpha)), margin=margin)
         held_out = np.flatnonzero(folds == fold)
         taus[held_out] = policy.stop_times(panel.subset(held_out))
         policies.append(policy)
