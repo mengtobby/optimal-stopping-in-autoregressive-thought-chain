@@ -156,6 +156,7 @@ def test_cli_without_torch(script, censor_args, tmp_path, monkeypatch):
         assert result["n_flip"] == 1
         assert result["auroc"] is None
         assert result["n_skipped"] == 0
+        assert result["n_failed"] == 0
     else:
         excluded = censor_args == ["--max-steps", "3"]
         assert result["n_traces"] == (0 if excluded else 1)
@@ -183,3 +184,52 @@ def test_runner_skips_missing_and_empty_spans(monkeypatch):
     )
     assert run_attention_pilot(NoAttention(), traces, {}).n_skipped == 1
     assert AttentionPilotResult(np.empty((0, 1)), np.empty((0, 1)), 0, 0, 0, 0).n_skipped == 0
+
+
+@pytest.mark.parametrize("value,expected", [(1.0000004, 1), (-1e-6, 0)])
+def test_trajectory_clips_rounding(value, expected):
+    class Rounded:
+        def attention_to_span(self, *args):
+            return np.full((1, 1, 1), value)
+
+    np.testing.assert_array_equal(
+        attention_trajectory(Rounded(), "", "ab", (0, 1), [2]), [expected]
+    )
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf, -0.002, 1.002])
+def test_trajectory_rejects_invalid_mass(value):
+    class Invalid:
+        def attention_to_span(self, *args):
+            return np.full((1, 1, 1), value)
+
+    with pytest.raises(AttentionError, match="finite and in"):
+        attention_trajectory(Invalid(), "", "ab", (0, 1), [2])
+
+
+@pytest.mark.parametrize("all_fail", [False, True])
+@pytest.mark.parametrize("failure", ["nan", "backend", "value", "attention"])
+def test_runner_continues_after_event_errors(all_fail, failure, caplog):
+    from osc.collect.hf_backend import BackendError
+
+    class Failing(Backend):
+        calls = 0
+
+        def attention_to_span(self, *args):
+            self.calls += 1
+            if all_fail or self.calls == 1:
+                if failure == "nan":
+                    return np.full((len(args[-1]), 1, 1), np.nan)
+                error = {"backend": BackendError, "value": ValueError, "attention": AttentionError}
+                raise error[failure]("probe failed")
+            return super().attention_to_span(*args)
+
+    backend = Failing()
+    traces = TraceSet((make_trace(), make_trace((0, 1, 1, 1))))
+    result = run_attention_pilot(backend, traces, {"p": "prompt"}, max_after=3)
+    assert backend.calls == 2
+    assert result.n_skipped == result.n_failed == (2 if all_fail else 1)
+    assert (result.n_flip, result.n_control) == (0, 0 if all_fail else 1)
+    assert np.isnan(result.auroc) and np.isnan(result.perm_p)
+    assert "problem p" in caplog.text
+    assert ("finite and in" if failure == "nan" else "probe failed") in caplog.text

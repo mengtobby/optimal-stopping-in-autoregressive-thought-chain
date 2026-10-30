@@ -1,5 +1,6 @@
 """Attention to earlier answers, matched by distance from the answer anchor."""
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
@@ -46,8 +47,13 @@ def attention_trajectory(
     values = np.asarray(backend.attention_to_span(prompt, thinking, span, query_char_positions))
     if values.ndim != 3 or values.shape[0] != len(query_char_positions):
         raise AttentionError("backend attention must have shape (n_queries, layers, heads)")
-    if 0 in values.shape or not np.all(np.isfinite(values)) or np.any((values < 0) | (values > 1)):
+    if (
+        0 in values.shape
+        or not np.all(np.isfinite(values))
+        or np.any((values < -1e-3) | (values > 1 + 1e-3))
+    ):
         raise AttentionError("backend attention must be non-empty, finite and in [0, 1]")
+    values = np.clip(values, 0, 1)
     if layers is not None:
         if not len(layers) or any(i < -values.shape[1] or i >= values.shape[1] for i in layers):
             raise AttentionError("selected layers must be non-empty and within backend layers")
@@ -65,6 +71,7 @@ class AttentionPilotResult:
     n_flip: int
     n_control: int
     n_skipped: int = 0
+    n_failed: int = 0
 
 
 def compare_flip_vs_control(
@@ -124,7 +131,7 @@ def run_attention_pilot(
     if max_after < 1:
         raise AttentionError("max_after must be positive")
     flips, controls, offsets = [], [], []
-    n_skipped = 0
+    n_skipped = n_failed = 0
     for event in find_anchor_events(traces):
         if not event.span_found or event.span[0] >= event.span[1]:
             n_skipped += 1
@@ -134,9 +141,23 @@ def run_attention_pilot(
             raise AttentionError(f"missing prompt for {trace.problem_id!r}")
         positions = event_query_positions(trace, event, max_after)
         curve = np.full(max_after, np.nan)
-        curve[: len(positions)] = attention_trajectory(
-            backend, prompts[trace.problem_id], thinking_text(trace), event.span, positions, layers
-        )
+        try:
+            curve[: len(positions)] = attention_trajectory(
+                backend,
+                prompts[trace.problem_id],
+                thinking_text(trace),
+                event.span,
+                positions,
+                layers,
+            )
+        except ValueError as exc:
+            # AttentionError and BackendError both inherit ValueError.
+            logging.getLogger(__name__).warning(
+                "Skipping attention event for problem %s: %s", trace.problem_id, exc
+            )
+            n_skipped += 1
+            n_failed += 1
+            continue
         if event.flip_step is None:
             controls.append(curve)
         else:
@@ -145,4 +166,4 @@ def run_attention_pilot(
     result = compare_flip_vs_control(
         np.array(flips).reshape(-1, max_after), np.array(controls).reshape(-1, max_after), offsets
     )
-    return replace(result, n_skipped=n_skipped)
+    return replace(result, n_skipped=n_skipped, n_failed=n_failed)
