@@ -3,6 +3,61 @@ import pytest
 pytestmark = pytest.mark.model
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_probe_logits_float32_before_matmul(masked):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from osc.collect.hf_backend import _probe_logits
+
+    class Tensor:
+        def __init__(self, data):
+            self.data = np.asarray(data)
+            self.shape = self.data.shape
+            self.device = "cpu"
+
+        def __getitem__(self, item):
+            return Tensor(self.data[item])
+
+        def float(self):
+            return Tensor(self.data.astype(np.float32))
+
+        def transpose(self, a, b):
+            return Tensor(self.data.swapaxes(a, b))
+
+        def __matmul__(self, other):
+            assert self.data.dtype == other.data.dtype == np.float32
+            return Tensor(self.data @ other.data)
+
+        def __mul__(self, scale):
+            return Tensor(self.data * scale)
+
+        def __gt__(self, other):
+            return self.data > other.data
+
+        def masked_fill(self, mask, value):
+            assert self.data.dtype == np.float32
+            return Tensor(np.where(mask, value, self.data))
+
+        def __add__(self, other):
+            assert self.data.dtype == other.data.dtype == np.float32
+            return Tensor(self.data + other.data)
+
+    torch = SimpleNamespace(
+        tensor=lambda data, **kwargs: Tensor(data),
+        arange=lambda n, **kwargs: Tensor(np.arange(n)),
+    )
+    # The unscaled dot product exceeds the largest finite float16 value.
+    query = Tensor(np.full((1, 1, 2, 2), 256, dtype=np.float16))
+    key = Tensor(np.full((1, 1, 3, 2), 256, dtype=np.float16))
+    mask = Tensor(np.full((1, 1, 2, 3), -2, dtype=np.float16)) if masked else None
+    logits = _probe_logits(torch, query, key, [0, 1], mask, 0.5).data
+    assert logits.dtype == np.float32
+    np.testing.assert_array_equal(logits[0, 0, 1, :2], [65536 - 2 * masked] * 2)
+    assert np.isneginf(logits[0, 0, 0, 1:]).all()
+
+
 @pytest.fixture
 def tiny_backend():
     torch = pytest.importorskip("torch")
