@@ -12,6 +12,18 @@ class BackendError(ValueError):
     """Invalid model request or unsupported tokenizer/model."""
 
 
+def _probe_logits(torch, query, key, queries, attention_mask, scale):
+    """Materialize only probe rows, with float32 arithmetic before the dot product."""
+    selected = query[:, :, queries, :].float()
+    logits = (selected @ key.float().transpose(-1, -2)) * scale
+    qids = torch.tensor(queries, device=query.device)
+    kids = torch.arange(key.shape[-2], device=query.device)
+    logits = logits.masked_fill(kids[None, :] > qids[:, None], float("-inf"))
+    if attention_mask is not None:
+        logits = logits + attention_mask[:, :, queries, : key.shape[-2]].float()
+    return logits
+
+
 class HFBackend:
     def __init__(
         self,
@@ -328,15 +340,10 @@ class HFBackend:
             key = key.repeat_interleave(repeats, dim=1)
             value = value.repeat_interleave(repeats, dim=1)
             scale = scaling if scaling is not None else query.shape[-1] ** -0.5
-            selected = query[:, :, queries, :]
-            logits = (selected @ key.transpose(-1, -2)) * scale
-            qids = torch.tensor(queries, device=query.device)
-            kids = torch.arange(key.shape[-2], device=query.device)
-            logits = logits.masked_fill(kids[None, :] > qids[:, None], float("-inf"))
-            if attention_mask is not None:
-                logits = logits + attention_mask[:, :, queries, : key.shape[-2]]
+            logits = _probe_logits(torch, query, key, queries, attention_mask, scale)
             weights = torch.softmax(logits.float(), dim=-1)
-            masses.append(weights[..., keys].sum(-1)[0].transpose(0, 1).cpu().numpy())
+            mass = weights[..., keys].sum(-1).clamp(0, 1)
+            masses.append(mass[0].transpose(0, 1).cpu().numpy())
             output = torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,

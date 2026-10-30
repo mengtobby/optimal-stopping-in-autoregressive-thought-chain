@@ -36,7 +36,7 @@ def test_synthetic_bounds_and_rendering():
     assert data["n_traces"] == 1500
     assert data["rows"][-1]["accuracy"] is None
     best = max(r.value for r in report.rows if r.family in ("heuristic", "learned"))
-    assert report.headroom == report.dual_upper - best
+    assert report.headroom == report.upper_bound - best
 
 
 def test_no_siblings_and_validation():
@@ -45,6 +45,10 @@ def test_no_siblings_and_validation():
     assert np.isnan(report.headroom_paired)
     assert report_to_json(report)["headroom_paired_ci"] == [None, None]
     assert np.isnan(report.dual_upper)
+    assert report.upper_bound == report.hindsight_value
+    assert report.upper_bound_source == "hindsight-prophet"
+    assert report.lsm_shrink == ()
+    assert report.irreducible_gap == 0.0
     assert np.isnan(report.dual_lsm_upper)
     assert report_to_json(report)["dual_lsm_upper_se"] is None
     assert any("No traces have siblings" in note for note in report.notes)
@@ -94,8 +98,8 @@ def test_cli(tmp_path):
 
 
 def test_paired_headroom_and_exact_row():
-    from osc.stopping.dual import dual_upper_bound, martingale_increments
-    from osc.stopping.lsm import cross_fit_lsm
+    from osc.stopping.dual import cross_fit_shrunk_dual, martingale_increments, scaled_value_fn
+    from osc.stopping.lsm import cross_fit_lsm, fit_lsm
     from osc.stopping.payoff import build_panel
     from osc.stopping.stats import cluster_bootstrap_mean_ci, cluster_standard_error
 
@@ -113,14 +117,22 @@ def test_paired_headroom_and_exact_row():
     panel = build_panel(traces, 0.05)
     times, policies, folds = cross_fit_lsm(panel, seed=8)
     differences = np.empty(len(traces))
-    dual_values = np.empty(len(traces))
+    shrunk, shrink = cross_fit_shrunk_dual(
+        panel,
+        folds,
+        [p.value for p in policies],
+        fit_value_fn=lambda train: fit_lsm(train).value,
+        seed=8,
+    )
+    assert report.lsm_shrink == shrink
+    dual_values = shrunk.per_trace
     for fold, policy in enumerate(policies):
         indices = np.flatnonzero(folds == fold)
         held = panel.subset(indices)
-        dual = dual_upper_bound(held, policy.value)
-        dual_values[indices] = dual.per_trace
-        differences[indices] = dual.per_trace - held.payoff[np.arange(len(indices)), times[indices]]
-        increments = martingale_increments(held, policy.value)
+        differences[indices] = (
+            dual_values[indices] - held.payoff[np.arange(len(indices)), times[indices]]
+        )
+        increments = martingale_increments(held, scaled_value_fn(policy.value, shrink[fold]))
         martingale = np.column_stack(
             (np.zeros(len(indices)), np.cumsum(increments[:, :-1], axis=1))
         )
@@ -129,7 +141,7 @@ def test_paired_headroom_and_exact_row():
         )
     assert report.dual_lsm_upper == pytest.approx(dual_values.mean())
     assert report.dual_lsm_upper_se == cluster_standard_error(dual_values, clusters)
-    lsm_row = next(row for row in report.rows if row.method == "dual-upper-cross-fit")
+    lsm_row = next(row for row in report.rows if row.method == "dual-lsm-shrunk-cross-fit")
     assert lsm_row.value_ci == cluster_bootstrap_mean_ci(dual_values, clusters, seed=8)
     anchors = [
         [
@@ -163,17 +175,31 @@ def test_paired_headroom_and_exact_row():
 def test_noisy_pathwise_headline():
     traces = sample_traceset(overthinking_model(feature_noise=0.6), 2000, 8, 0)
     report = headroom_report(traces, 0.05, pathwise_config=PathwiseConfig())
+    assert report.upper_bound <= report.hindsight_value
+    assert report.upper_bound == min(
+        report.hindsight_value, report.dual_upper, report.dual_lsm_upper
+    )
+    assert len(report.lsm_shrink) == 5
+    assert report.upper_bound == next(
+        row.value for row in report.rows if row.method == report.upper_bound_source
+    )
     se = report.dual_upper_se
     assert report.dual_upper <= report.hindsight_value + 2 * se
     assert report.dual_upper <= report.dual_lsm_upper + 2 * se
     assert report.dual_upper >= report.lsm_lower - 3 * se
     assert report.irreducible_gap >= -2 * se
-    assert report.irreducible_gap == report.hindsight_value - report.dual_upper
+    assert report.irreducible_gap == report.hindsight_value - report.upper_bound
     data = report_to_json(report)
+    json.dumps(data, allow_nan=False)
+    assert data["lsm_shrink"] == list(report.lsm_shrink)
+    assert data["upper_bound"] == report.upper_bound
+    assert data["upper_bound_source"] == report.upper_bound_source
     markdown = report_to_markdown(report)
+    assert f"Source: {report.upper_bound_source}." in markdown
+    assert "LSM shrink factors by fold:" in markdown
     for method, value in (
-        ("dual-upper-cross-fit", report.dual_lsm_upper),
-        ("dual-pathwise-cross-fit", report.dual_upper),
+        ("dual-lsm-shrunk-cross-fit", report.dual_lsm_upper),
+        ("dual-pathwise-l1-cross-fit", report.dual_upper),
     ):
         row = next(row for row in data["rows"] if row["method"] == method)
         assert row["family"] == "bound"
