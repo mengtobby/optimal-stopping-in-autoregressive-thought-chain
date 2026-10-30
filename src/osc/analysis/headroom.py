@@ -16,8 +16,8 @@ from osc.stopping.baselines import (
     select_param,
     token_budget_stop_times,
 )
-from osc.stopping.dual import dual_upper_bound
-from osc.stopping.lsm import LSMConfig, cross_fit_lsm
+from osc.stopping.dual import cross_fit_shrunk_dual
+from osc.stopping.lsm import LSMConfig, cross_fit_lsm, fit_lsm
 from osc.stopping.pathwise import PathwiseConfig, cross_fit_pathwise_dual
 from osc.stopping.payoff import build_panel, evaluate_stop_times
 from osc.stopping.prophet import (
@@ -62,6 +62,9 @@ class HeadroomReport:
     headroom_paired_ci: tuple[float, float] = (float("nan"), float("nan"))
     dual_lsm_upper: float = float("nan")
     dual_lsm_upper_se: float = float("nan")
+    lsm_shrink: tuple[float, ...] = ()
+    upper_bound: float = float("nan")
+    upper_bound_source: str = ""
 
 
 _DEFAULT_LSM_CONFIG = LSMConfig()
@@ -166,16 +169,21 @@ def headroom_report(
     lsm_upper, lsm_se = float("nan"), float("nan")
     paired = float("nan")
     paired_ci = (float("nan"), float("nan"))
+    lsm_shrink: tuple[float, ...] = ()
     if any(trace.has_siblings for trace in traces):
-        values = np.empty(len(traces))
-        for fold, policy in enumerate(policies):
-            indices = np.flatnonzero(folds == fold)
-            values[indices] = dual_upper_bound(panel.subset(indices), policy.value).per_trace
+        lsm_dual, lsm_shrink = cross_fit_shrunk_dual(
+            panel,
+            folds,
+            [p.value for p in policies],
+            fit_value_fn=lambda train: fit_lsm(train, lsm_config).value,
+            seed=seed,
+        )
+        values = lsm_dual.per_trace
         lsm_upper = float(values.mean())
         lsm_se = cluster_standard_error(values, clusters)
         rows.append(
             HeadroomRow(
-                "dual-upper-cross-fit",
+                "dual-lsm-shrunk-cross-fit",
                 "bound",
                 lsm_upper,
                 cluster_bootstrap_mean_ci(values, clusters, seed=seed),
@@ -206,7 +214,7 @@ def headroom_report(
         paired_ci = cluster_bootstrap_mean_ci(differences, clusters, seed=seed)
         rows.append(
             HeadroomRow(
-                "dual-pathwise-cross-fit",
+                "dual-pathwise-l1-cross-fit",
                 "bound",
                 upper,
                 cluster_bootstrap_mean_ci(values, clusters, seed=seed),
@@ -219,6 +227,18 @@ def headroom_report(
     else:
         notes.append("No traces have siblings; the dual upper bound is unavailable.")
     best = max(row.value for row in rows if row.family in ("heuristic", "learned"))
+    upper_bound_source, upper_bound = min(
+        (
+            (source, value)
+            for source, value in (
+                ("hindsight-prophet", prophet.value),
+                ("dual-pathwise-l1-cross-fit", upper),
+                ("dual-lsm-shrunk-cross-fit", lsm_upper),
+            )
+            if not np.isnan(value)
+        ),
+        key=lambda item: item[1],
+    )
     return HeadroomReport(
         float(lam),
         len(traces),
@@ -227,13 +247,16 @@ def headroom_report(
         upper,
         se,
         lower,
-        prophet.value - upper,
-        upper - best,
+        prophet.value - upper_bound,
+        upper_bound - best,
         tuple(notes),
         paired,
         paired_ci,
         lsm_upper,
         lsm_se,
+        lsm_shrink,
+        upper_bound,
+        upper_bound_source,
     )
 
 
@@ -274,6 +297,15 @@ def report_to_markdown(report: HeadroomReport) -> str:
     lines.extend(
         [
             "",
+            f"Selected upper bound: {number(report.upper_bound)}. "
+            f"Source: {report.upper_bound_source}.",
+            "LSM shrink factors by fold: "
+            + (", ".join(number(c) for c in report.lsm_shrink) or "N/A")
+            + ".",
+            "The hindsight value is itself a valid upper bound (zero martingale); "
+            "the reported bound is the smallest of three valid estimates, which is "
+            "slightly optimistic in finite samples.",
+            "",
             f"Hindsight value: {number(report.hindsight_value)}. "
             f"Pathwise dual upper: {number(report.dual_upper)} "
             f"(SE {number(report.dual_upper_se)}). "
@@ -288,10 +320,10 @@ def report_to_markdown(report: HeadroomReport) -> str:
             "",
             "Hindsight can choose after seeing the future. The dual upper bound limits "
             "what an observable stopping policy can achieve, while held-out LSM gives an "
-            "achievable lower estimate. The hindsight-minus-dual gap measures the estimated "
-            "cost of lacking future information; paired headroom is the mean per-trace "
-            "dual minus LSM payoff, with a paired bootstrap interval. "
-            "Headroom is the dual minus the best "
+            "achievable lower estimate. The hindsight-minus-selected-bound gap measures "
+            "the estimated cost of lacking future information; paired headroom is the mean "
+            "per-trace dual minus LSM payoff, with a paired bootstrap interval. "
+            "Headroom is the selected upper bound minus the best "
             "evaluated implementable policy. Sampling noise can reverse estimated gaps.",
             "The pathwise bound targets a tighter upper estimate by optimizing a combination "
             "of basis martingales on training folds, including the LSM anchors, then "
