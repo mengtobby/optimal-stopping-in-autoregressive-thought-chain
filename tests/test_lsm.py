@@ -6,8 +6,9 @@ import numpy as np
 import pytest
 
 from osc.data.schema import Trace, TraceSet
-from osc.stopping.lsm import LSMConfig, cross_fit_lsm, fit_lsm
+from osc.stopping.lsm import LSMConfig, cross_fit_lsm, fit_lsm, select_lsm_hyperparams
 from osc.stopping.payoff import build_panel, evaluate_stop_times
+from osc.stopping.synthetic import overthinking_model, sample_traceset
 
 
 def toy(n=6000, seed=42):
@@ -108,6 +109,14 @@ def test_sparse_fallback_no_pca_and_single_state():
         {"ridge_alpha": -1},
         {"ridge_alpha": float("nan")},
         {"min_samples": 0},
+        {"margins": ()},
+        {"margins": (-0.1,)},
+        {"margins": (float("nan"),)},
+        {"ridge_alphas": ()},
+        {"ridge_alphas": (float("inf"),)},
+        {"ridge_alphas": (-1,)},
+        {"inner_folds": 1},
+        {"inner_folds": 2.5},
     ],
 )
 def test_invalid_config(kwargs):
@@ -160,3 +169,80 @@ def test_problem_grouped_folds_and_unique_id_compatibility():
         assert len(set(folds[3 * i : 3 * i + 3])) == 1
     with pytest.raises(ValueError, match="number of problems"):
         cross_fit_lsm(panel, n_folds=21)
+
+
+def test_infinite_margin_finishes_without_changing_value():
+    panel, _ = toy(30)
+    policy = fit_lsm(panel)
+    finish = replace(policy, margin=float("inf"))
+    np.testing.assert_array_equal(finish.stop_times(panel), panel.horizons - 1)
+    x, tokens = panel.features[:, 0], panel.cum_tokens[:, 0]
+    np.testing.assert_array_equal(finish.value(0, x, tokens), policy.value(0, x, tokens))
+
+
+def test_increasing_payoff_recovers_finishing():
+    panel, _ = toy(150)
+    traces = TraceSet(
+        tuple(replace(tr, forced_correct=np.linspace(0, 1, tr.n_steps)) for tr in panel.traces)
+    )
+    panel = build_panel(traces, 0)
+    taus, _, _ = cross_fit_lsm(panel, n_folds=3, seed=4)
+    assert evaluate_stop_times(panel, taus, "lsm").value >= (
+        evaluate_stop_times(panel, panel.horizons - 1, "finish").value - 0.001
+    )
+
+
+def test_overthinking_selects_early_stopping():
+    panel = build_panel(sample_traceset(overthinking_model(0.05), 300, 0, 18), 0.01)
+    taus, policies, _ = cross_fit_lsm(panel, n_folds=3, seed=2)
+    assert all(np.isfinite(policy.margin) for policy in policies)
+    assert evaluate_stop_times(panel, taus, "lsm").value > (
+        evaluate_stop_times(panel, panel.horizons - 1, "finish").value + 0.1
+    )
+
+
+def test_selection_fallback_and_conservative_ties():
+    panel, _ = toy(12)
+    assert select_lsm_hyperparams(panel, LSMConfig(inner_folds=13)) == (1.0, float("inf"))
+    constant = build_panel(
+        TraceSet(tuple(replace(tr, forced_correct=np.ones(tr.n_steps)) for tr in panel.traces)),
+        0,
+    )
+    assert select_lsm_hyperparams(constant) == (100.0, float("inf"))
+
+
+def test_nested_selection_uses_only_training_problem_groups(monkeypatch):
+    import osc.stopping.lsm as lsm
+
+    panel, _ = toy(36)
+    panel = build_panel(
+        TraceSet(tuple(replace(tr, problem_id=str(i // 3)) for i, tr in enumerate(panel.traces))),
+        panel.lam,
+        panel.token_scale,
+    )
+    original_fit = lsm.fit_lsm
+    original_evaluate = lsm.evaluate_stop_times
+    training_ids = set()
+
+    def fit(train, config):
+        nonlocal training_ids
+        training_ids = {tr.problem_id for tr in train.traces}
+        return original_fit(train, config)
+
+    def evaluate(held_out, taus, name):
+        assert training_ids.isdisjoint(tr.problem_id for tr in held_out.traces)
+        return original_evaluate(held_out, taus, name)
+
+    monkeypatch.setattr(lsm, "fit_lsm", fit)
+    monkeypatch.setattr(lsm, "evaluate_stop_times", evaluate)
+    original_select = lsm.select_lsm_hyperparams
+    selected_ids = []
+
+    def select(train, config, seed):
+        selected_ids.append({tr.problem_id for tr in train.traces})
+        return original_select(train, config, seed)
+
+    monkeypatch.setattr(lsm, "select_lsm_hyperparams", select)
+    _, _, folds = cross_fit_lsm(panel, n_folds=3)
+    for fold, ids in enumerate(selected_ids):
+        assert ids == {tr.problem_id for i, tr in enumerate(panel.traces) if folds[i] != fold}
