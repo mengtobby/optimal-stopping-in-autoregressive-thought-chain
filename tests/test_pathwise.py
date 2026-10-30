@@ -119,9 +119,9 @@ def test_training_subsets_and_order(small_panel, monkeypatch):
     seen = []
     original = pathwise.fit_pathwise_beta
 
-    def spy(panel, basis, config):
+    def spy(panel, basis, config, l1_penalty=0.0):
         seen.append([trace.problem_id for trace in panel.traces])
-        return original(panel, basis, config)
+        return original(panel, basis, config, l1_penalty)
 
     monkeypatch.setattr(pathwise, "fit_pathwise_beta", spy)
     result, _ = cross_fit_pathwise_dual(
@@ -153,6 +153,10 @@ def test_solver_failure(small_panel, monkeypatch):
         {"n_time_bins": 0},
         {"beta_bound": np.inf},
         {"include_tokens": 1},
+        {"l1_penalties": ()},
+        {"l1_penalties": (-1,)},
+        {"inner_folds": 1},
+        {"inner_folds": True},
     ],
 )
 def test_invalid_config(kwargs):
@@ -181,3 +185,78 @@ def test_no_transitions():
     result = pathwise_dual(panel, basis, fit_pathwise_beta(panel, basis))
     assert result.upper == 0.2
     assert result.mean_abs_increment == result.martingale_coverage == 0
+
+
+def test_large_l1_penalty_is_hindsight(small_panel):
+    basis = build_basis(small_panel)
+    beta = fit_pathwise_beta(small_panel, basis, l1_penalty=1e6)
+    np.testing.assert_array_equal(beta, np.zeros(len(basis.value_fns)))
+    np.testing.assert_array_equal(
+        pathwise_dual(small_panel, basis, beta).per_trace,
+        np.nanmax(small_panel.payoff, axis=1),
+    )
+    for penalty in [-1, np.inf, np.nan]:
+        with pytest.raises(PathwiseError):
+            fit_pathwise_beta(small_panel, basis, l1_penalty=penalty)
+
+
+def test_regularized_noisy_small_panel():
+    from osc.stopping.lsm import fit_lsm
+
+    panel = build_panel(sample_traceset(overthinking_model(feature_noise=0.6), 120, 2, 21), 0.05)
+    folds = np.arange(panel.n_traces) % 3
+    anchors = [
+        [("value", fit_lsm(panel.subset(np.flatnonzero(folds != f))).value)] for f in range(3)
+    ]
+    result, _ = cross_fit_pathwise_dual(panel, folds, anchors)
+    hindsight = np.nanmax(panel.payoff, axis=1).mean()
+    assert result.upper <= hindsight + 2 * result.upper_se
+    assert result.upper <= 1 + 2 * result.upper_se
+    old, _ = cross_fit_pathwise_dual(
+        panel, folds, anchors, PathwiseConfig(beta_bound=10, l1_penalties=(0.0,))
+    )
+    assert old.upper > hindsight + 2 * old.upper_se
+
+
+def test_group_validation(small_panel):
+    from dataclasses import replace
+
+    from osc.data.schema import TraceSet
+
+    traces = list(small_panel.traces)
+    traces[1] = replace(traces[1], problem_id=traces[0].problem_id)
+    panel = build_panel(TraceSet(tuple(traces)), 0.05)
+    with pytest.raises(PathwiseError, match="problem"):
+        cross_fit_pathwise_dual(panel, np.arange(panel.n_traces) % 2, [(), ()])
+    with pytest.raises(PathwiseError, match="contiguous"):
+        cross_fit_pathwise_dual(panel, np.arange(panel.n_traces) % 2 * 2, [(), ()])
+
+
+def test_penalty_selection_uses_only_outer_training(small_panel, monkeypatch):
+    folds = np.arange(small_panel.n_traces) % 2
+    original_build = pathwise.build_basis
+    original_fit = pathwise._fit_beta
+    outer_ids = set()
+    calls = []
+
+    def build(train, anchors, config):
+        nonlocal outer_ids
+        outer_ids = {trace.problem_id for trace in train.traces}
+        calls.append([])
+        return original_build(train, anchors, config)
+
+    def fit(train, martingales, config, penalty):
+        ids = {trace.problem_id for trace in train.traces}
+        assert ids <= outer_ids
+        calls[-1].append((ids, penalty))
+        return original_fit(train, martingales, config, penalty)
+
+    monkeypatch.setattr(pathwise, "build_basis", build)
+    monkeypatch.setattr(pathwise, "_fit_beta", fit)
+    config = PathwiseConfig(n_components=1, n_time_bins=1, l1_penalties=(0.0, 1.0))
+    cross_fit_pathwise_dual(small_panel, folds, [(), ()], config)
+    for f, fits in enumerate(calls):
+        expected = {trace.problem_id for i, trace in enumerate(small_panel.traces) if folds[i] != f}
+        assert len(fits) == 7
+        assert fits[-1][0] == expected
+        assert all(ids < expected for ids, _ in fits[:-1])

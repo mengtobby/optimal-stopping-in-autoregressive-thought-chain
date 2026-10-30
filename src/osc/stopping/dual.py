@@ -1,6 +1,6 @@
 """Nested-simulation martingale upper bounds for reasoning stopping problems."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,6 +26,100 @@ class DualResult:
 def zero_value_fn(t: int, features: np.ndarray, cum_tokens: np.ndarray) -> np.ndarray:
     """Zero martingale, recovering the hindsight prophet bound."""
     return np.zeros(len(features))
+
+
+def scaled_value_fn(value_fn: ValueFn, c: float) -> ValueFn:
+    """Scale a fixed value function; zero recovers the hindsight martingale."""
+    if not callable(value_fn) or not np.isfinite(c) or c < 0:
+        raise DualError("value_fn must be callable and c finite and non-negative")
+    if c == 0:
+        return zero_value_fn
+
+    def scaled(t: int, features: np.ndarray, tokens: np.ndarray) -> np.ndarray:
+        return c * _values(value_fn, t, features, tokens)
+
+    return scaled
+
+
+def _validate_folds(panel: PayoffPanel, folds: np.ndarray, k: int) -> np.ndarray:
+    folds = np.asarray(folds)
+    if (
+        folds.shape != (panel.n_traces,)
+        or folds.dtype.kind not in "iu"
+        or k < 2
+        or not np.array_equal(np.unique(folds), np.arange(k))
+    ):
+        raise DualError("folds must assign every trace to contiguous nonempty folds 0..K-1")
+    groups: dict[str, int] = {}
+    for trace, fold in zip(panel.traces, folds, strict=True):
+        if groups.setdefault(trace.problem_id, int(fold)) != fold:
+            raise DualError("all traces from a problem must share a fold")
+    return folds
+
+
+def _inner_assignments(panel: PayoffPanel, k: int, seed: int) -> np.ndarray | None:
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 2:
+        raise DualError("inner_folds must be an integer at least 2")
+    ids = list(dict.fromkeys(trace.problem_id for trace in panel.traces))
+    if len(ids) < k:
+        return None
+    order = np.random.default_rng(seed).permutation(len(ids))
+    assignments = {ids[index]: rank % k for rank, index in enumerate(order)}
+    return np.array([assignments[trace.problem_id] for trace in panel.traces])
+
+
+def cross_fit_shrunk_dual(
+    panel: PayoffPanel,
+    folds: np.ndarray,
+    value_fns_by_fold: Sequence[ValueFn],
+    fit_value_fn: Callable[[PayoffPanel], ValueFn],
+    grid: Sequence[float] = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0),
+    inner_folds: int = 3,
+    seed: int = 0,
+) -> tuple[DualResult, tuple[float, ...]]:
+    """Select shrinkage on grouped inner folds, then evaluate independent outer folds.
+
+    Each supplied outer value function must exclude that fold and its siblings.
+    Inner value functions are refitted without their validation problems.
+    """
+    folds = _validate_folds(panel, folds, len(value_fns_by_fold))
+    candidates = sorted(set(grid))
+    if not candidates or any(not np.isfinite(c) or c < 0 for c in candidates):
+        raise DualError("grid must contain finite non-negative shrink factors")
+    if not callable(fit_value_fn) or not all(map(callable, value_fns_by_fold)):
+        raise DualError("value functions and fit_value_fn must be callable")
+    values, chosen = np.empty(panel.n_traces), []
+    absolute_increments = 0.0
+    for f, vf in enumerate(value_fns_by_fold):
+        train = panel.subset(np.flatnonzero(folds != f))
+        inner = _inner_assignments(train, inner_folds, seed + f)
+        c = 0.0
+        if inner is not None:
+            scores = np.zeros(len(candidates))
+            for g in range(inner_folds):
+                fitted = fit_value_fn(train.subset(np.flatnonzero(inner != g)))
+                validation = train.subset(np.flatnonzero(inner == g))
+                for j, candidate in enumerate(candidates):
+                    scores[j] += dual_upper_bound(
+                        validation, scaled_value_fn(fitted, candidate)
+                    ).per_trace.sum()
+            c = float(candidates[int(np.argmin(scores))])
+        indices = np.flatnonzero(folds == f)
+        test = panel.subset(indices)
+        result = dual_upper_bound(test, scaled_value_fn(vf, c))
+        values[indices] = result.per_trace
+        absolute_increments += result.mean_abs_increment * np.sum(test.horizons - 1)
+        chosen.append(c)
+    baseline = dual_upper_bound(panel, zero_value_fn)
+    values.setflags(write=False)
+    transitions = int(np.sum(panel.horizons - 1))
+    return DualResult(
+        float(values.mean()),
+        float(values.std(ddof=1) / np.sqrt(len(values))),
+        values,
+        baseline.martingale_coverage,
+        float(absolute_increments / transitions) if transitions else 0.0,
+    ), tuple(chosen)
 
 
 def _values(value_fn: ValueFn, t: int, features: np.ndarray, tokens: np.ndarray) -> np.ndarray:
