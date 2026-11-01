@@ -70,3 +70,9 @@ def test_subset_and_bootstrap(panel):
     assert lo < 0.5 < hi
     with pytest.raises(PanelError):
         bootstrap_mean_ci(np.array([]))
+
+
+def test_panel_semantic_answer_ids():
+    trace = _trace("a", [0.0, 1.0, 1.0], [None, r"(3, \frac{\pi}{2})", r"3,\dfrac{\pi}{2}"])
+    panel = build_panel(TraceSet((trace,)), lam=0.1)
+    np.testing.assert_array_equal(panel.answer_ids[0], [-1, 0, 0])
