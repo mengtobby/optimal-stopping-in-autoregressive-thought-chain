@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from osc.collect.answers import grade_samples
+from osc.collect.answers import extract_boxed, grade_samples, is_equivalent
 from osc.collect.datasets import Problem
 from osc.collect.protocol import ReasoningBackend
 from osc.collect.segment import first_step, segment_thinking
@@ -74,10 +74,28 @@ def collect_trace_with_stats(
     texts = ("", *(thinking[a:b] for a, b in spans))
     ends = [0, *(b for _, b in spans)]
     answers, correct = [], []
+    scored_answers = getattr(backend, "force_answers_scored", None)
+    agreement, confidence = [], []
     for end in ends:
-        answer, score = grade_samples(
-            backend.force_answers(problem.prompt, thinking[:end], config.n_forced), problem.answer
-        )
+        if callable(scored_answers):
+            scored = scored_answers(problem.prompt, thinking[:end], config.n_forced)
+            samples = [sample for sample, _ in scored]
+            probabilities = np.asarray([value for _, value in scored], dtype=float)
+            if np.any(~np.isfinite(probabilities)) or np.any(
+                (probabilities < 0) | (probabilities > 1)
+            ):
+                raise CollectionError("backend returned invalid answer confidence")
+        else:
+            samples = backend.force_answers(problem.prompt, thinking[:end], config.n_forced)
+        answer, score = grade_samples(samples, problem.answer)
+        if callable(scored_answers):
+            agreement.append(
+                sum(is_equivalent(extract_boxed(sample), answer) for sample in samples)
+                / len(samples)
+                if answer is not None and samples
+                else 0.0
+            )
+            confidence.append(float(np.mean(probabilities)) if samples else float("nan"))
         answers.append(answer)
         correct.append(score)
     features = backend.hidden_features(problem.prompt, thinking, ends)
@@ -156,6 +174,8 @@ def collect_trace_with_stats(
         natural,
         correct[-1],
         tuple(siblings),
+        forced_agreement=np.asarray(agreement) if callable(scored_answers) else None,
+        forced_confidence=np.asarray(confidence) if callable(scored_answers) else None,
     )
     return trace, SiblingStats(
         len(texts) - 1, n_with, n_draws, n_extended, n_ended, n_truncated, n_no_budget
