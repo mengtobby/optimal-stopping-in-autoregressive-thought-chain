@@ -3,6 +3,8 @@
 Research code for measuring how much "overthinking" in reasoning models can be removed by any early-exit rule, and why the rest remains.
 
 - [docs/research-ideas.md](docs/research-ideas.md): candidate ideas, the prior work they were checked against, and the chosen direction.
+- [docs/results-run1.md](docs/results-run1.md): first real-trace results (math500, R1-Distill-Qwen-1.5B) and what changed for run 2.
+- [docs/cloud.md](docs/cloud.md): running collection and analysis on free Kaggle/Colab GPUs.
 
 ## What is here
 
@@ -49,7 +51,11 @@ python scripts/pilot_elicit.py --traces data/traces/r1d7b-math500/merged --probl
 
 Tests: `pytest -q --cov` (coverage gate 80%).
 
-## Status (2026-10-22)
+## Status (2026-10-31)
 
-- Core bounds, baselines, collection and pilots are implemented and tested on synthetic data. The exact optimal value is bracketed by LSM below and the pathwise dual above, within noise.
-- Not yet run on real reasoning traces. That needs a GPU machine.
+- Core bounds, baselines, collection and pilots are implemented and tested on synthetic data.
+- Run 1 (97 math500 traces, free Kaggle T4) is analysed in [docs/results-run1.md](docs/results-run1.md):
+  - Hindsight stopping would reach 83% accuracy with 65% fewer tokens, against 76% for full traces.
+  - No implementable policy beats finishing yet.
+  - The regularized dual bounds fall back to hindsight because 2 siblings every 4th step are too noisy.
+- Run 2 (4 siblings every 2nd step, 3072 thinking tokens) is the test of whether the dual becomes informative.
