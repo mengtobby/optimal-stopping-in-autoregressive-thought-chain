@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -45,6 +47,19 @@ def test_trace_arrays_are_read_only_copies():
         {"features": np.zeros((2, 2))},
         {"step_texts": ("a",)},
         {"final_correct": 2.0},
+        {"forced_agreement": np.array([0.0, 1.1, 1.0])},
+        {"forced_agreement": np.array([0.0, -0.1, 1.0])},
+        {"forced_agreement": np.array([0.0, np.nan, 1.0])},
+        {"forced_agreement": np.array([0.0, np.inf, 1.0])},
+        {"forced_confidence": np.array([0.0, 1.1, 1.0])},
+        {"forced_confidence": np.array([0.0, -0.1, 1.0])},
+        {"forced_confidence": np.array([0.0, np.inf, 1.0])},
+        {"forced_confidence": np.array([0.0, -np.inf, 1.0])},
+        *[
+            {name: np.zeros(shape)}
+            for name in ("forced_agreement", "forced_confidence")
+            for shape in ((2,), (3, 1))
+        ],
     ],
 )
 def test_trace_validation(kwargs):
@@ -102,3 +117,39 @@ def test_roundtrip(tmp_path):
 def test_load_missing_files(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_traceset(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["forced_agreement", "forced_confidence"])
+def test_optional_signals_are_read_only_float64_copies(name):
+    source = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+    tr = replace(_trace(), **{name: source})
+    source[0] = 1.0
+    values = getattr(tr, name)
+    assert values.dtype == np.float64
+    assert values[0] == 0.0
+    with pytest.raises(ValueError):
+        values[0] = 1.0
+
+
+@pytest.mark.parametrize("agreement", [False, True])
+@pytest.mark.parametrize("confidence", [False, True])
+def test_optional_signals_roundtrip(tmp_path, agreement, confidence):
+    tr = replace(
+        _trace(),
+        forced_agreement=np.array([0.0, 0.5, 1.0]) if agreement else None,
+        forced_confidence=np.array([np.nan, 0.0, 1.0]) if confidence else None,
+    )
+    directory = save_traceset(TraceSet((tr,)), tmp_path / "out")
+    with np.load(directory / "arrays.npz", allow_pickle=False) as arrays:
+        assert ("0/forced_agreement" in arrays) == agreement
+        assert ("0/forced_confidence" in arrays) == confidence
+    loaded = load_traceset(directory)[0]
+    for name in ("forced_agreement", "forced_confidence"):
+        expected = getattr(tr, name)
+        actual = getattr(loaded, name)
+        if expected is None:
+            assert actual is None
+        else:
+            np.testing.assert_array_equal(actual, expected)
+            assert actual.dtype == np.float64
+            assert not actual.flags.writeable

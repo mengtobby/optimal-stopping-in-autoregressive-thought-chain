@@ -26,6 +26,10 @@ def save_traceset(traces: TraceSet, directory: str | Path) -> Path:
             arrays[f"{i}/step_tokens"] = tr.step_tokens
             arrays[f"{i}/forced_correct"] = tr.forced_correct
             arrays[f"{i}/features"] = tr.features
+            for name in ("forced_agreement", "forced_confidence"):
+                values = getattr(tr, name)
+                if values is not None:
+                    arrays[f"{i}/{name}"] = values
             sibling_steps = []
             for t, sib in enumerate(tr.siblings):
                 if sib is None:
@@ -92,4 +96,6 @@ def _trace_from_record(record: dict[str, Any], arrays: Any) -> Trace:
         natural_stop=record["natural_stop"],
         final_correct=record["final_correct"],
         siblings=siblings,
+        forced_agreement=arrays.get(f"{i}/forced_agreement"),
+        forced_confidence=arrays.get(f"{i}/forced_confidence"),
     )
