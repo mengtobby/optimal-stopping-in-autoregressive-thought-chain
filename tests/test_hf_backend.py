@@ -346,3 +346,91 @@ def test_auto_dtype_uses_native_cuda_capability(
         assert "no devices were enumerated" in caplog.text
     if device != "auto":
         model.to.assert_called_once_with(device)
+
+
+@pytest.mark.parametrize("text,count", [("1}later", 2), (r"\frac{1}{2}}x", 12), ("123", 3)])
+def test_answer_confidence_closing_brace(text, count):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from osc.collect.hf_backend import HFBackend
+
+    backend = HFBackend.__new__(HFBackend)
+    backend.tokenizer = SimpleNamespace(decode=lambda ids, **kw: "".join(ids))
+    scores = -np.arange(1, len(text) + 1, dtype=float)
+    assert backend._answer_confidence(list(text), scores) == pytest.approx(
+        np.exp(np.mean(scores[:count]))
+    )
+
+
+def test_scored_generation_without_model():
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from osc.collect.hf_backend import BackendError, HFBackend
+
+    class Encoded(dict):
+        def __init__(self):
+            self.input_ids = np.array([[9, 9]])
+            super().__init__(input_ids=self.input_ids)
+
+        def to(self, device):
+            return self
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def __call__(self, *args, **kwargs):
+            return Encoded()
+
+        def decode(self, ids, **kwargs):
+            return "".join({1: "1", 2: "}", 3: "tail"}[int(i)] for i in ids)
+
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        sequences = np.tile([9, 9, 1, 2, 3], (kwargs["num_return_sequences"], 1))
+        if kwargs.get("output_scores"):
+            assert kwargs["return_dict_in_generate"]
+            return SimpleNamespace(sequences=sequences, scores="scores")
+        return sequences
+
+    def transition(sequences, scores, normalize_logits):
+        assert scores == "scores" and normalize_logits
+        return np.tile(np.log([0.25, 1, 0.01]), (len(sequences), 1))
+
+    backend = HFBackend.__new__(HFBackend)
+    backend.tokenizer = Tokenizer()
+    backend.torch = SimpleNamespace(inference_mode=nullcontext)
+    backend.model = SimpleNamespace(
+        device="cpu", generate=generate, compute_transition_scores=transition
+    )
+    backend._prompt = lambda prompt: prompt
+    backend.temperature, backend.top_p = 0.6, 0.95
+    assert backend.force_answers("q", "", 2) == [r"\boxed{1}tail"] * 2
+    assert "output_scores" not in calls[-1]
+    assert backend.force_answers_scored("q", "", 2) == [(r"\boxed{1}tail", 0.5)] * 2
+    assert calls[-1]["num_return_sequences"] == 2
+    backend.temperature = 0
+    assert backend.force_answers_scored("q", "", 3) == [(r"\boxed{1}tail", 0.5)] * 3
+    assert calls[-1]["num_return_sequences"] == 1
+    assert backend.force_answers_scored("q", "", 0) == []
+    with pytest.raises(BackendError, match="nonnegative"):
+        backend.force_answers_scored("q", "", -1)
+
+
+def test_answer_confidence_invalid_and_zero_probability():
+    from types import SimpleNamespace
+
+    from osc.collect.hf_backend import BackendError, HFBackend
+
+    backend = HFBackend.__new__(HFBackend)
+    backend.tokenizer = SimpleNamespace(decode=lambda ids, **kw: "1}")
+    assert backend._answer_confidence([1], [float("-inf")]) == 0
+    for scores in ([], [0.1], [float("nan")]):
+        with pytest.raises(BackendError):
+            backend._answer_confidence([1], scores)

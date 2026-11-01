@@ -63,6 +63,14 @@ class FakeBackend:
             raise ValueError("scripted answers must be nonempty")
         return [samples[i % len(samples)] for i in range(n_samples)]
 
+    def force_answers_scored(
+        self, prompt: str, thinking_prefix: str, n_samples: int
+    ) -> list[tuple[str, float]]:
+        if n_samples < 0:
+            raise ValueError("n_samples must be nonnegative")
+        confidence = 0.2 + 0.75 * ((len(thinking_prefix) * 37) % 101) / 100
+        return [(a, confidence) for a in self.force_answers(prompt, thinking_prefix, n_samples)]
+
     def continue_steps(
         self, prompt: str, thinking_prefix: str, k: int, max_tokens: int
     ) -> list[str]:

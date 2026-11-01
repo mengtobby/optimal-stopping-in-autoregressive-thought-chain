@@ -239,6 +239,16 @@ class HFBackend:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def force_answers(self, prompt: str, thinking_prefix: str, n_samples: int) -> list[str]:
+        return self._force_answers(prompt, thinking_prefix, n_samples, scored=False)
+
+    def force_answers_scored(
+        self, prompt: str, thinking_prefix: str, n_samples: int
+    ) -> list[tuple[str, float]]:
+        return self._force_answers(prompt, thinking_prefix, n_samples, scored=True)
+
+    def _force_answers(
+        self, prompt: str, thinking_prefix: str, n_samples: int, *, scored: bool
+    ) -> list:
         if n_samples < 0:
             raise BackendError("n_samples must be nonnegative")
         if n_samples == 0:
@@ -250,6 +260,8 @@ class HFBackend:
         options = {"do_sample": self.temperature > 0}
         if options["do_sample"]:
             options.update(temperature=self.temperature, top_p=self.top_p)
+        if scored:
+            options.update(output_scores=True, return_dict_in_generate=True)
         # Greedy generation cannot return multiple sequences; repeat its identical result.
         count = n_samples if options["do_sample"] else 1
         with self.torch.inference_mode():
@@ -260,12 +272,42 @@ class HFBackend:
                 pad_token_id=self.tokenizer.eos_token_id,
                 **options,
             )
+        sequences = output.sequences if scored else output
         answers = [
             "\\boxed{"
             + self.tokenizer.decode(row[encoded.input_ids.shape[1] :], skip_special_tokens=True)
-            for row in output
+            for row in sequences
         ]
+        if scored:
+            with self.torch.inference_mode():
+                scores = self.model.compute_transition_scores(
+                    sequences, output.scores, normalize_logits=True
+                )
+            answers = [
+                (answer, self._answer_confidence(row[encoded.input_ids.shape[1] :], score))
+                for answer, row, score in zip(answers, sequences, scores, strict=True)
+            ]
         return answers if options["do_sample"] else answers * n_samples
+
+    def _answer_confidence(self, token_ids, transition_scores) -> float:
+        """Include the token closing the pre-opened box, including nested braces."""
+        count = len(transition_scores)
+        for end in range(1, count + 1):
+            text = self.tokenizer.decode(token_ids[:end], skip_special_tokens=True)
+            depth = 1
+            for char in text:
+                depth += (char == "{") - (char == "}")
+                if depth == 0:
+                    count = end
+                    break
+            if depth == 0:
+                break
+        if count == 0:
+            raise BackendError("no generated answer token scores")
+        values = [float(value) for value in transition_scores[:count]]
+        if any(np.isnan(value) or value > 0 for value in values):
+            raise BackendError("invalid answer token log-probabilities")
+        return float(np.exp(np.mean(values)))
 
     def continue_steps(
         self, prompt: str, thinking_prefix: str, k: int, max_tokens: int
