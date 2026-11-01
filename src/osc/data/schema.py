@@ -12,6 +12,11 @@ Only ``forced_correct`` / ``final_correct`` need ground truth. Everything else (
 forced answers, token counts, features) is observable at decision time, so stopping
 policies may use it but must never read correctness.
 
+Optional observable signals (no ground truth) are ``forced_agreement``, the fraction
+of forced-answer samples equivalent to their majority answer, and
+``forced_confidence``, the mean over samples of the geometric-mean token probability
+of the boxed answer. Confidence may be NaN when unavailable.
+
 ``siblings[t]`` (for ``t < T - 1``) holds ``K`` alternative next steps sampled
 independently from the prefix ending at step ``t``: one-step continuations used for
 nested (Andersen-Broadie) martingale estimates in the dual bound.
@@ -86,6 +91,8 @@ class Trace:
     natural_stop: bool  # True if the model closed its thinking itself after step T-1
     final_correct: float  # correctness of the model's own final answer, in [0, 1]
     siblings: tuple[SiblingSet | None, ...] = ()  # empty, or length T (last entry None)
+    forced_agreement: np.ndarray | None = None  # (T,) float in [0, 1]
+    forced_confidence: np.ndarray | None = None  # (T,) float, NaN or in [0, 1]
 
     def __post_init__(self) -> None:
         tokens = _frozen(self.step_tokens, np.int64, "step_tokens", 1)
@@ -102,6 +109,16 @@ class Trace:
             raise SchemaError("step_tokens must be non-negative")
         _check_prob(correct, "forced_correct")
         _check_prob(np.array([self.final_correct], dtype=np.float64), "final_correct")
+        for name in ("forced_agreement", "forced_confidence"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            values = _frozen(values, np.float64, name, 1)
+            if values.shape != (t,):
+                raise SchemaError(f"{name} must have length T")
+            observed = values[~np.isnan(values)] if name == "forced_confidence" else values
+            _check_prob(observed, name)
+            object.__setattr__(self, name, values)
         siblings = tuple(self.siblings)
         if siblings:
             if len(siblings) != t:
