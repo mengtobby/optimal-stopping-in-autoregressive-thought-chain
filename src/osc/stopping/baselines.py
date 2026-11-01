@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -74,7 +75,7 @@ class CorrectnessProbe:
 
 
 def fit_correctness_probe(
-    panel: PayoffPanel, n_components: int | None = 32, C: float = 1.0
+    panel: PayoffPanel, n_components: int | None = 32, C: float = 1.0, passthrough: int = 0
 ) -> CorrectnessProbe:
     if n_components is not None and (
         not isinstance(n_components, (int, np.integer))
@@ -85,14 +86,30 @@ def fit_correctness_probe(
     if not np.isfinite(C) or C <= 0:
         raise BaselineError("C must be finite and positive")
     features = _features(panel)
+    if (
+        not isinstance(passthrough, (int, np.integer))
+        or isinstance(passthrough, bool)
+        or not 0 <= passthrough <= features.shape[1]
+    ):
+        raise BaselineError("passthrough must be an integer between zero and the feature dimension")
     labels = (panel.accuracy[panel.alive] >= 0.5).astype(int)
     if np.unique(labels).size == 1:
         return CorrectnessProbe(None, float(labels[0]), features.shape[1])
     steps = [("scaler", StandardScaler())]
+    leading_dim = features.shape[1] - passthrough
     if n_components is not None:
         steps.append(
-            ("pca", PCA(n_components=min(n_components, *features.shape), svd_solver="full"))
+            (
+                "pca",
+                PCA(n_components=min(n_components, len(features), leading_dim), svd_solver="full"),
+            )
         )
+    if passthrough:
+        transformers = []
+        if leading_dim:
+            transformers.append(("leading", Pipeline(steps), slice(0, leading_dim)))
+        transformers.append(("signals", StandardScaler(), slice(leading_dim, features.shape[1])))
+        steps = [("features", ColumnTransformer(transformers))]
     steps.append(("logistic", LogisticRegression(C=C, max_iter=1000, random_state=0)))
     model = Pipeline(steps).fit(features, labels)
     return CorrectnessProbe(model, None, features.shape[1])

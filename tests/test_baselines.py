@@ -80,3 +80,38 @@ def test_constants_cross_fit_and_selection():
     for candidates in [[], [np.nan]]:
         with pytest.raises(BaselineError):
             select_param(panel, candidates, token_budget_stop_times)
+
+
+def signal_panel(seed):
+    rng = np.random.default_rng(seed)
+    labels = rng.integers(0, 2, size=(120, 2))
+    panel = make_panel(labels)
+    common = rng.normal(size=(120, 2, 1))
+    noise = common + 0.1 * rng.normal(size=(120, 2, 40))
+    features = np.concatenate((noise, labels[:, :, None]), axis=2)
+    accuracy = np.column_stack((labels[:, 0], np.full(120, 0.5)))
+    return replace(panel, features=features, accuracy=accuracy, payoff=accuracy)
+
+
+def test_probe_passthrough_preserves_signal_and_default_behavior():
+    train, test = signal_panel(10), signal_panel(11)
+    train = replace(train, accuracy=train.features[:, :, -1])
+    test = replace(test, accuracy=test.features[:, :, -1])
+    default = fit_correctness_probe(train, n_components=1)
+    zero = fit_correctness_probe(train, n_components=1, passthrough=0)
+    np.testing.assert_array_equal(default.scores(test), zero.scores(test))
+    np.testing.assert_array_equal(
+        probe_threshold_stop_times(test, default.scores(test), 0.5),
+        probe_threshold_stop_times(test, zero.scores(test), 0.5),
+    )
+    preserved = fit_correctness_probe(train, n_components=1, passthrough=1)
+    labels = test.accuracy[:, 0]
+    default_accuracy = np.mean((default.scores(test)[:, 0] >= 0.5) == labels)
+    signal_accuracy = np.mean((preserved.scores(test)[:, 0] >= 0.5) == labels)
+    assert signal_accuracy > default_accuracy + 0.2
+    for components in [None, 1]:
+        all_signals = fit_correctness_probe(train, components, passthrough=41)
+        assert np.isfinite(all_signals.scores(test)[test.alive]).all()
+    for bad in [-1, 42, 1.5, True]:
+        with pytest.raises(BaselineError, match="passthrough"):
+            fit_correctness_probe(train, passthrough=bad)
