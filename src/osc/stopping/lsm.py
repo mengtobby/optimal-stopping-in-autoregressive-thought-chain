@@ -25,8 +25,11 @@ class LSMConfig:
     margins: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, inf)
     ridge_alphas: tuple[float, ...] = (1.0, 10.0, 100.0)
     inner_folds: int = 3
+    passthrough: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.passthrough, int) or self.passthrough < 0:
+            raise LSMError("passthrough must be a non-negative integer")
         if self.n_components is not None and (
             not isinstance(self.n_components, int) or self.n_components < 1
         ):
@@ -54,6 +57,8 @@ class LSMPolicy:
     lam: float
     token_scale: float
     margin: float = 0.0
+    passthrough: int = 0
+    passthrough_scaler: StandardScaler | None = None
 
     def _basis(self, t: int, features: np.ndarray, cum_tokens: np.ndarray) -> np.ndarray:
         if not isinstance(t, (int, np.integer)) or t < 0:
@@ -66,12 +71,17 @@ class LSMPolicy:
             raise LSMError("features and cum_tokens must be finite")
         if np.any(tokens < 0):
             raise LSMError("cum_tokens must be non-negative")
+        signals = x[:, self.feature_dim - self.passthrough :]
+        x = x[:, : self.feature_dim - self.passthrough]
         if len(x) and self.scaler is not None:
             x = self.scaler.transform(x)
             if self.pca is not None:
                 x = self.pca.transform(x)
         elif self.pca is not None:
             x = np.empty((0, self.pca.n_components_))
+        if self.passthrough_scaler is not None:
+            signals = self.passthrough_scaler.transform(signals) if len(x) else signals
+            x = np.column_stack((x, signals))
         return np.column_stack(
             (x, np.full(len(x), t / self.t_max_train), tokens / self.token_scale)
         )
@@ -122,20 +132,40 @@ def fit_lsm(panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG) -> LSMPolic
     x = panel.features[alive].astype(float)
     if not len(x) or not np.all(np.isfinite(x)):
         raise LSMError("training panel must contain finite alive features")
-    scaler = StandardScaler().fit(x) if x.shape[1] else None
-    scaled = scaler.transform(x) if scaler is not None else x
+    if config.passthrough > x.shape[1]:
+        raise LSMError("passthrough must not exceed the feature dimension")
+    leading = x[:, : x.shape[1] - config.passthrough]
+    scaler = StandardScaler().fit(leading) if leading.shape[1] else None
+    scaled = scaler.transform(leading) if scaler is not None else leading
     pca = None
-    if config.n_components is not None and min(x.shape[1], len(x) - 1) > 0:
+    if config.n_components is not None and min(leading.shape[1], len(x) - 1) > 0:
         pca = PCA(
-            n_components=min(config.n_components, x.shape[1], len(x) - 1), svd_solver="full"
+            n_components=min(config.n_components, leading.shape[1], len(x) - 1),
+            svd_solver="full",
         ).fit(scaled)
         scaled = pca.transform(scaled)
+    passthrough_scaler = None
+    if config.passthrough:
+        signals = x[:, -config.passthrough :]
+        passthrough_scaler = StandardScaler().fit(signals)
+        scaled = np.column_stack((scaled, passthrough_scaler.transform(signals)))
     times = np.broadcast_to(np.arange(panel.t_max), alive.shape)[alive]
     basis = np.column_stack(
         (scaled, times / panel.t_max, panel.cum_tokens[alive] / panel.token_scale)
     )
     head = Ridge(alpha=config.ridge_alpha).fit(basis, panel.accuracy[alive])
-    policy = LSMPolicy(scaler, pca, head, (), x.shape[1], panel.t_max, panel.lam, panel.token_scale)
+    policy = LSMPolicy(
+        scaler,
+        pca,
+        head,
+        (),
+        x.shape[1],
+        panel.t_max,
+        panel.lam,
+        panel.token_scale,
+        passthrough=config.passthrough,
+        passthrough_scaler=passthrough_scaler,
+    )
     cashflow = panel.payoff[np.arange(panel.n_traces), panel.horizons - 1].copy()
     models: list[Ridge | float] = []
     pooled_x: list[np.ndarray] = []
@@ -168,6 +198,8 @@ def fit_lsm(panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG) -> LSMPolic
         panel.t_max,
         panel.lam,
         panel.token_scale,
+        passthrough=config.passthrough,
+        passthrough_scaler=passthrough_scaler,
     )
 
 
