@@ -236,27 +236,28 @@ def test_penalty_selection_uses_only_outer_training(small_panel, monkeypatch):
     folds = np.arange(small_panel.n_traces) % 2
     original_build = pathwise.build_basis
     original_fit = pathwise._fit_beta
-    outer_ids = set()
-    calls = []
+    builds, fits = [], []
 
     def build(train, anchors, config):
-        nonlocal outer_ids
-        outer_ids = {trace.problem_id for trace in train.traces}
-        calls.append([])
+        builds.append({trace.problem_id for trace in train.traces})
         return original_build(train, anchors, config)
 
     def fit(train, martingales, config, penalty):
-        ids = {trace.problem_id for trace in train.traces}
-        assert ids <= outer_ids
-        calls[-1].append((ids, penalty))
+        fits.append(({trace.problem_id for trace in train.traces}, penalty))
         return original_fit(train, martingales, config, penalty)
 
     monkeypatch.setattr(pathwise, "build_basis", build)
     monkeypatch.setattr(pathwise, "_fit_beta", fit)
     config = PathwiseConfig(n_components=1, n_time_bins=1, l1_penalties=(0.0, 1.0))
     cross_fit_pathwise_dual(small_panel, folds, [(), ()], config)
-    for f, fits in enumerate(calls):
+    per_fold_builds, per_fold_fits = 1 + config.inner_folds, 2 * config.inner_folds + 1
+    assert len(builds) == 2 * per_fold_builds and len(fits) == 2 * per_fold_fits
+    for f in range(2):
         expected = {trace.problem_id for i, trace in enumerate(small_panel.traces) if folds[i] != f}
-        assert len(fits) == 7
-        assert fits[-1][0] == expected
-        assert all(ids < expected for ids, _ in fits[:-1])
+        fold_builds = builds[f * per_fold_builds : (f + 1) * per_fold_builds]
+        fold_fits = fits[f * per_fold_fits : (f + 1) * per_fold_fits]
+        # Outer basis first, then one basis per inner fold rebuilt without its validation.
+        assert fold_builds[0] == expected
+        assert all(ids < expected for ids in fold_builds[1:])
+        assert fold_fits[-1][0] == expected
+        assert all(ids < expected for ids, _ in fold_fits[:-1])

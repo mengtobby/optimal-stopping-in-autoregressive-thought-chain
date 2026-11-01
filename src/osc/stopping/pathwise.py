@@ -262,15 +262,19 @@ def cross_fit_pathwise_dual(
         penalty = max(penalties)
         if inner is not None and len(penalties) > 1 and basis.value_fns:
             scores = np.zeros(len(penalties))
-            martingales = basis_martingales(train, basis)
             for g in range(config.inner_folds):
-                train_indices = np.flatnonzero(inner != g)
-                validation_indices = np.flatnonzero(inner == g)
-                inner_train = train.subset(train_indices)
-                validation = train.subset(validation_indices)
+                inner_train = train.subset(np.flatnonzero(inner != g))
+                validation = train.subset(np.flatnonzero(inner == g))
+                # Rebuild PCA/scales without validation paths. Anchors were fitted on the
+                # whole outer-train fold, which only biases selection, never validity.
+                inner_basis = build_basis(inner_train, anchors, config)
+                if not inner_basis.value_fns:
+                    continue
+                train_martingales = basis_martingales(inner_train, inner_basis)
+                validation_martingales = basis_martingales(validation, inner_basis)
                 for j, candidate in enumerate(penalties):
-                    beta = _fit_beta(inner_train, martingales[:, train_indices], config, candidate)
-                    m = np.einsum("j,jnt->nt", beta, martingales[:, validation_indices])
+                    beta = _fit_beta(inner_train, train_martingales, config, candidate)
+                    m = np.einsum("j,jnt->nt", beta, validation_martingales)
                     scores[j] += np.nanmax(
                         validation.payoff - m[:, : validation.t_max], axis=1
                     ).sum()

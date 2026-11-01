@@ -204,7 +204,11 @@ def select_lsm_hyperparams(
 def cross_fit_lsm(
     panel: PayoffPanel, config: LSMConfig = _DEFAULT_CONFIG, n_folds: int = 5, seed: int = 0
 ) -> tuple[np.ndarray, tuple[LSMPolicy, ...], np.ndarray]:
-    """Return held-out stop times and policies tuned solely on each outer training fold."""
+    """Return held-out stop times and policies tuned solely on each outer training fold.
+
+    ridge_alpha and margin are selected from config.ridge_alphas and config.margins;
+    config.ridge_alpha is only the fallback when a fold has too few problems to tune.
+    """
     folds = _problem_folds(panel, n_folds, seed)
     taus = np.empty(panel.n_traces, dtype=np.int64)
     policies = []

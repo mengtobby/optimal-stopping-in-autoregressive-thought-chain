@@ -137,3 +137,25 @@ def test_shrink_validation_and_small_training_fallback():
     np.testing.assert_array_equal(fn(0, np.ones((2, 1)), np.zeros(2)), [0.25, 0.25])
     zero = scaled_value_fn(lambda *args: (_ for _ in ()).throw(AssertionError()), 0)
     np.testing.assert_array_equal(zero(0, np.ones((2, 1)), np.zeros(2)), [0, 0])
+
+
+def test_per_fold_refitters_are_used_for_their_own_fold():
+    from osc.stopping.synthetic import overthinking_model
+
+    panel = build_panel(sample_traceset(overthinking_model(), 30, 2, 9), 0.05)
+    folds = np.arange(panel.n_traces) % 2
+    calls = []
+
+    def refitter(f):
+        def fit(train):
+            calls.append(f)
+            return zero_value_fn
+
+        return fit
+
+    _, scales = cross_fit_shrunk_dual(panel, folds, [zero_value_fn] * 2, [refitter(0), refitter(1)])
+    assert calls == [0, 0, 0, 1, 1, 1]
+    assert len(scales) == 2
+    for bad in [[refitter(0)], [refitter(0), "not callable"]]:
+        with pytest.raises(DualError, match="one callable per fold"):
+            cross_fit_shrunk_dual(panel, folds, [zero_value_fn] * 2, bad)

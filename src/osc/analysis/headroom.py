@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -16,10 +17,10 @@ from osc.stopping.baselines import (
     select_param,
     token_budget_stop_times,
 )
-from osc.stopping.dual import cross_fit_shrunk_dual
+from osc.stopping.dual import ValueFn, cross_fit_shrunk_dual
 from osc.stopping.lsm import LSMConfig, cross_fit_lsm, fit_lsm
 from osc.stopping.pathwise import PathwiseConfig, cross_fit_pathwise_dual
-from osc.stopping.payoff import build_panel, evaluate_stop_times
+from osc.stopping.payoff import PayoffPanel, build_panel, evaluate_stop_times
 from osc.stopping.prophet import (
     hindsight_prophet,
     independent_dp_thresholds,
@@ -68,6 +69,12 @@ class HeadroomReport:
 
 
 _DEFAULT_LSM_CONFIG = LSMConfig()
+
+
+def _lsm_refitter(config: LSMConfig, alpha: float) -> Callable[[PayoffPanel], ValueFn]:
+    """Refit with the outer fold's selected alpha, so shrinkage suits that value fn."""
+    tuned = replace(config, ridge_alpha=alpha)
+    return lambda train: fit_lsm(train, tuned).value
 
 
 def headroom_report(
@@ -175,7 +182,7 @@ def headroom_report(
             panel,
             folds,
             [p.value for p in policies],
-            fit_value_fn=lambda train: fit_lsm(train, lsm_config).value,
+            fit_value_fn=[_lsm_refitter(lsm_config, p.payoff_model.alpha) for p in policies],
             seed=seed,
         )
         values = lsm_dual.per_trace

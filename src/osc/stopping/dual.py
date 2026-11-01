@@ -72,7 +72,7 @@ def cross_fit_shrunk_dual(
     panel: PayoffPanel,
     folds: np.ndarray,
     value_fns_by_fold: Sequence[ValueFn],
-    fit_value_fn: Callable[[PayoffPanel], ValueFn],
+    fit_value_fn: Callable[[PayoffPanel], ValueFn] | Sequence[Callable[[PayoffPanel], ValueFn]],
     grid: Sequence[float] = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0),
     inner_folds: int = 3,
     seed: int = 0,
@@ -80,13 +80,19 @@ def cross_fit_shrunk_dual(
     """Select shrinkage on grouped inner folds, then evaluate independent outer folds.
 
     Each supplied outer value function must exclude that fold and its siblings.
-    Inner value functions are refitted without their validation problems.
+    Inner value functions are refitted without their validation problems. Pass one
+    fit_value_fn per fold to refit with that fold's own (outer-train) hyperparameters.
     """
     folds = _validate_folds(panel, folds, len(value_fns_by_fold))
     candidates = sorted(set(grid))
     if not candidates or any(not np.isfinite(c) or c < 0 for c in candidates):
         raise DualError("grid must contain finite non-negative shrink factors")
-    if not callable(fit_value_fn) or not all(map(callable, value_fns_by_fold)):
+    fitters = (
+        [fit_value_fn] * len(value_fns_by_fold) if callable(fit_value_fn) else list(fit_value_fn)
+    )
+    if len(fitters) != len(value_fns_by_fold) or not all(map(callable, fitters)):
+        raise DualError("fit_value_fn must be callable or one callable per fold")
+    if not all(map(callable, value_fns_by_fold)):
         raise DualError("value functions and fit_value_fn must be callable")
     values, chosen = np.empty(panel.n_traces), []
     absolute_increments = 0.0
@@ -97,7 +103,7 @@ def cross_fit_shrunk_dual(
         if inner is not None:
             scores = np.zeros(len(candidates))
             for g in range(inner_folds):
-                fitted = fit_value_fn(train.subset(np.flatnonzero(inner != g)))
+                fitted = fitters[f](train.subset(np.flatnonzero(inner != g)))
                 validation = train.subset(np.flatnonzero(inner == g))
                 for j, candidate in enumerate(candidates):
                     scores[j] += dual_upper_bound(
