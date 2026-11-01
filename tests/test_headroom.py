@@ -14,6 +14,7 @@ from osc.analysis.headroom import (
     report_to_json,
     report_to_markdown,
 )
+from osc.stopping.lsm import LSMConfig
 from osc.stopping.pathwise import PathwiseConfig, cross_fit_pathwise_dual
 from osc.stopping.synthetic import (
     default_model,
@@ -23,20 +24,35 @@ from osc.stopping.synthetic import (
     sample_traceset,
 )
 
+# Small grids keep the fast tests fast; the slow tests use the production defaults.
+FAST_LSM = LSMConfig(margins=(0.0, float("inf")), ridge_alphas=(10.0,), inner_folds=2)
+FAST_PATHWISE = PathwiseConfig(l1_penalties=(0.0, 0.1), inner_folds=2)
 
-def test_synthetic_bounds_and_rendering():
-    model = default_model()
-    report = headroom_report(sample_traceset(model, 1500, 4, 0), 0.05)
+
+def _check_rendering(report, n_traces):
     assert report.hindsight_value >= report.dual_upper - 1e-9
-    assert report.dual_upper >= report.lsm_lower - 3 * report.dual_upper_se
-    assert report.dual_upper >= exact_value(model, 0.05) - 3 * report.dual_upper_se
     markdown = report_to_markdown(report)
     assert all(row.method in markdown for row in report.rows)
     data = json.loads(json.dumps(report_to_json(report), allow_nan=False))
-    assert data["n_traces"] == 1500
+    assert data["n_traces"] == n_traces
     assert data["rows"][-1]["accuracy"] is None
     best = max(r.value for r in report.rows if r.family in ("heuristic", "learned"))
     assert report.headroom == report.upper_bound - best
+
+
+def test_small_bounds_and_rendering():
+    traces = sample_traceset(default_model(), 200, 2, 0)
+    report = headroom_report(traces, 0.05, lsm_config=FAST_LSM, pathwise_config=FAST_PATHWISE)
+    _check_rendering(report, 200)
+
+
+@pytest.mark.slow
+def test_synthetic_bounds_and_rendering():
+    model = default_model()
+    report = headroom_report(sample_traceset(model, 1500, 4, 0), 0.05)
+    _check_rendering(report, 1500)
+    assert report.dual_upper >= report.lsm_lower - 3 * report.dual_upper_se
+    assert report.dual_upper >= exact_value(model, 0.05) - 3 * report.dual_upper_se
 
 
 def test_no_siblings_and_validation():
@@ -66,7 +82,7 @@ def test_cli(tmp_path):
     spec = importlib.util.spec_from_file_location("headroom_cli", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.main(["--synthetic", "300", "--lam", "0.05", "--out", str(tmp_path)]) == 0
+    assert module.main(["--synthetic", "120", "--lam", "0.05", "--out", str(tmp_path)]) == 0
     data = json.loads((tmp_path / "report_lam0.05.json").read_text())
     assert data["exact_value"] == exact_value(default_model(), 0.05)
     assert (tmp_path / "report_lam0.05.md").is_file()
@@ -76,7 +92,7 @@ def test_cli(tmp_path):
             module.main(
                 [
                     "--synthetic",
-                    "100",
+                    "60",
                     "--model",
                     "overthinking",
                     "--feature-noise",
@@ -104,7 +120,7 @@ def test_paired_headroom_and_exact_row():
     from osc.stopping.stats import cluster_bootstrap_mean_ci, cluster_standard_error
 
     model = default_model()
-    traces = sample_traceset(model, 300, 8, 8)
+    traces = sample_traceset(model, 150, 8, 8)
     traces = replace(
         traces,
         traces=tuple(
@@ -172,9 +188,7 @@ def test_paired_headroom_and_exact_row():
     assert "Paired headroom:" in report_to_markdown(report)
 
 
-def test_noisy_pathwise_headline():
-    traces = sample_traceset(overthinking_model(feature_noise=0.6), 2000, 8, 0)
-    report = headroom_report(traces, 0.05, pathwise_config=PathwiseConfig())
+def _check_headline(report):
     assert report.upper_bound <= report.hindsight_value
     assert report.upper_bound == min(
         report.hindsight_value, report.dual_upper, report.dual_lsm_upper
@@ -183,11 +197,6 @@ def test_noisy_pathwise_headline():
     assert report.upper_bound == next(
         row.value for row in report.rows if row.method == report.upper_bound_source
     )
-    se = report.dual_upper_se
-    assert report.dual_upper <= report.hindsight_value + 2 * se
-    assert report.dual_upper <= report.dual_lsm_upper + 2 * se
-    assert report.dual_upper >= report.lsm_lower - 3 * se
-    assert report.irreducible_gap >= -2 * se
     assert report.irreducible_gap == report.hindsight_value - report.upper_bound
     data = report_to_json(report)
     json.dumps(data, allow_nan=False)
@@ -208,3 +217,21 @@ def test_noisy_pathwise_headline():
     assert data["dual_lsm_upper"] == report.dual_lsm_upper
     assert "Pathwise dual upper:" in markdown
     assert "LSM dual upper:" in markdown
+
+
+def test_small_noisy_headline():
+    traces = sample_traceset(overthinking_model(feature_noise=0.6), 200, 2, 0)
+    report = headroom_report(traces, 0.05, lsm_config=FAST_LSM, pathwise_config=FAST_PATHWISE)
+    _check_headline(report)
+
+
+@pytest.mark.slow
+def test_noisy_pathwise_headline():
+    traces = sample_traceset(overthinking_model(feature_noise=0.6), 2000, 8, 0)
+    report = headroom_report(traces, 0.05, pathwise_config=PathwiseConfig())
+    _check_headline(report)
+    se = report.dual_upper_se
+    assert report.dual_upper <= report.hindsight_value + 2 * se
+    assert report.dual_upper <= report.dual_lsm_upper + 2 * se
+    assert report.dual_upper >= report.lsm_lower - 3 * se
+    assert report.irreducible_gap >= -2 * se

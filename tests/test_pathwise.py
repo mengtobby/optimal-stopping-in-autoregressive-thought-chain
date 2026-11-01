@@ -82,36 +82,57 @@ def test_basis_scaling_interactions_and_nonfinite(small_panel):
     assert result.upper_se == 0
 
 
-def test_exact_anchor_cross_fit():
+@pytest.mark.parametrize(
+    ("n_traces", "tolerance"),
+    [(400, 0.05), pytest.param(3000, 0.02, marks=pytest.mark.slow)],
+)
+def test_exact_anchor_cross_fit(n_traces, tolerance):
     model = overthinking_model()
-    panel = build_panel(sample_traceset(model, 3000, 8, 42), 0.05)
+    panel = build_panel(sample_traceset(model, n_traces, 8, 42), 0.05)
     folds = np.arange(panel.n_traces) % 3
     anchor = [("exact", exact_state_value_fn(model, 0.05))]
     result, betas = cross_fit_pathwise_dual(
         panel, folds, [anchor] * 3, PathwiseConfig(0, 1, include_tokens=False)
     )
     truth = exact_value(model, 0.05)
-    assert abs(result.upper - truth) < 0.02
+    assert abs(result.upper - truth) < tolerance
     assert result.upper >= truth - 3 * result.upper_se
     assert len(betas) == 3
 
 
-def test_noisy_lsm_anchors_cross_fit():
+def _noisy_lsm_anchor_bound(n_traces, k_siblings, lsm_config, pathwise_config=None):
     model = overthinking_model(feature_noise=0.6)
-    panel = build_panel(sample_traceset(model, 3000, 8, 21), 0.05)
-    _, policies, folds = cross_fit_lsm(panel, LSMConfig(n_components=5), n_folds=3, seed=3)
+    panel = build_panel(sample_traceset(model, n_traces, k_siblings, 21), 0.05)
+    _, policies, folds = cross_fit_lsm(panel, lsm_config, n_folds=3, seed=3)
     anchors = [
         [("value", p.value), ("payoff", p.payoff_estimate), ("continuation", p.continuation)]
         for p in policies
     ]
-    result, _ = cross_fit_pathwise_dual(panel, folds, anchors)
+    result, _ = cross_fit_pathwise_dual(panel, folds, anchors, pathwise_config or PathwiseConfig())
     lsm_values = np.empty(panel.n_traces)
     for f, policy in enumerate(policies):
         indices = np.flatnonzero(folds == f)
         lsm_values[indices] = dual_upper_bound(panel.subset(indices), policy.value).per_trace
-    assert result.upper <= np.nanmax(panel.payoff, axis=1).mean() + 2 * result.upper_se
+    return result, lsm_values, np.nanmax(panel.payoff, axis=1), exact_value(model, 0.05)
+
+
+def test_small_noisy_lsm_anchors_cross_fit():
+    fast_lsm = LSMConfig(n_components=5, margins=(0.0,), ridge_alphas=(10.0,), inner_folds=2)
+    fast_pathwise = PathwiseConfig(l1_penalties=(0.0, 0.1), inner_folds=2)
+    result, _, hindsight, truth = _noisy_lsm_anchor_bound(240, 2, fast_lsm, fast_pathwise)
+    assert result.per_trace.shape == hindsight.shape
+    assert np.all(np.isfinite(result.per_trace))
+    assert result.upper >= truth - 3 * result.upper_se
+
+
+@pytest.mark.slow
+def test_noisy_lsm_anchors_cross_fit():
+    result, lsm_values, hindsight, truth = _noisy_lsm_anchor_bound(
+        3000, 8, LSMConfig(n_components=5)
+    )
+    assert result.upper <= hindsight.mean() + 2 * result.upper_se
     assert result.upper <= lsm_values.mean() + 2 * result.upper_se
-    assert result.upper >= exact_value(model, 0.05) - 3 * result.upper_se
+    assert result.upper >= truth - 3 * result.upper_se
 
 
 def test_training_subsets_and_order(small_panel, monkeypatch):
@@ -261,3 +282,13 @@ def test_penalty_selection_uses_only_outer_training(small_panel, monkeypatch):
         assert all(ids < expected for ids in fold_builds[1:])
         assert fold_fits[-1][0] == expected
         assert all(ids < expected for ids, _ in fold_fits[:-1])
+
+
+def test_last_input_cache_reuses_only_identical_arrays():
+    calls = []
+    cached = pathwise._last_input_cache(lambda x: calls.append(1) or x * 2)
+    first, second = np.ones((2, 3)), np.ones((2, 3))
+    assert cached(first) is cached(first)
+    np.testing.assert_array_equal(cached(second), second * 2)
+    cached(first)
+    assert len(calls) == 3

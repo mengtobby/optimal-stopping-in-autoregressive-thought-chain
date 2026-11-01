@@ -144,7 +144,16 @@ def martingale_increments(panel: PayoffPanel, value_fn: ValueFn) -> np.ndarray:
     loosen the bound (in expectation); they do not invalidate it. The function
     must not be fitted using these evaluation paths or sibling draws.
     """
-    increments = np.zeros_like(panel.payoff)
+    return martingale_increments_many(panel, (value_fn,))[0]
+
+
+def martingale_increments_many(panel: PayoffPanel, value_fns: Sequence[ValueFn]) -> np.ndarray:
+    """Increments of shape (J, N, T) for several value functions, gathering states once.
+
+    At each t all functions see the same outer array, then the same sibling array,
+    so functions sharing work (such as PCA scores) can reuse it per input array.
+    """
+    increments = np.zeros((len(value_fns), *panel.payoff.shape))
     for t in range(panel.t_max - 1):
         rows, siblings = [], []
         for i, trace in enumerate(panel.traces):
@@ -153,16 +162,18 @@ def martingale_increments(panel: PayoffPanel, value_fn: ValueFn) -> np.ndarray:
                 siblings.append(trace.siblings[t])
         if not rows:
             continue
-        outer = _values(value_fn, t + 1, panel.features[rows, t + 1], panel.cum_tokens[rows, t + 1])
+        outer_features = panel.features[rows, t + 1]
+        outer_tokens = panel.cum_tokens[rows, t + 1]
         features = np.concatenate([s.features for s in siblings])
         tokens = np.concatenate(
             [panel.cum_tokens[i, t] + s.step_tokens for i, s in zip(rows, siblings, strict=True)]
         )
-        inner = _values(value_fn, t + 1, features, tokens)
-        offset = 0
-        for j, (i, sibling) in enumerate(zip(rows, siblings, strict=True)):
-            increments[i, t] = outer[j] - inner[offset : offset + sibling.k].mean()
-            offset += sibling.k
+        owners = np.repeat(np.arange(len(rows)), [s.k for s in siblings])
+        counts = np.bincount(owners, minlength=len(rows))
+        outer = [_values(fn, t + 1, outer_features, outer_tokens) for fn in value_fns]
+        inner = [_values(fn, t + 1, features, tokens) for fn in value_fns]
+        for j in range(len(value_fns)):
+            increments[j, rows, t] = outer[j] - np.bincount(owners, inner[j], len(rows)) / counts
     return increments
 
 

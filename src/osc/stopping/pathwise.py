@@ -5,7 +5,7 @@ martingale M, so E max(Z - M) bounds every observable stopping rule. The
 in-sample LP objective is optimistic; only held-out values should be reported.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,7 +20,7 @@ from osc.stopping.dual import (
     ValueFn,
     _inner_assignments,
     _validate_folds,
-    martingale_increments,
+    martingale_increments_many,
 )
 from osc.stopping.payoff import PayoffPanel
 
@@ -82,6 +82,23 @@ def _finite_values(fn: ValueFn, t: int, x: np.ndarray, tokens: np.ndarray) -> np
     return np.where(np.isfinite(values), values, 0.0)
 
 
+def _last_input_cache(
+    transform: Callable[[np.ndarray], np.ndarray],
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Reuse the result while basis functions are evaluated on the same array object.
+
+    Callers pass freshly gathered, unmodified arrays, so identity implies equal input.
+    """
+    last: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def cached(features: np.ndarray) -> np.ndarray:
+        if not last or last[0][0] is not features:
+            last[:] = [(features, transform(features))]
+        return last[0][1]
+
+    return cached
+
+
 _DEFAULT_CONFIG = PathwiseConfig()
 
 
@@ -107,14 +124,20 @@ def build_basis(
     if count:
         scaler = StandardScaler().fit(x)
         pca = PCA(n_components=count, svd_solver="full").fit(scaler.transform(x))
+        scores = _last_input_cache(lambda features: pca.transform(scaler.transform(features)))
         for j in range(count):
 
             def score(t: int, features: np.ndarray, tokens: np.ndarray, j: int = j) -> np.ndarray:
-                return pca.transform(scaler.transform(features))[:, j]
+                return scores(features)[:, j]
 
             raw.append((f"pca-{j}", score))
     if config.include_tokens:
         raw.append(("tokens", lambda t, features, tokens: np.asarray(tokens) / 1000.0))
+    alive = panel_train.alive
+    states = [
+        (panel_train.features[alive[:, t], t], panel_train.cum_tokens[alive[:, t], t])
+        for t in range(panel_train.t_max)
+    ]
     names, functions = [], []
     for name, fn in raw:
         if not isinstance(name, str) or not callable(fn):
@@ -134,14 +157,7 @@ def build_basis(
                 return _finite_values(fn, t, features, tokens)
 
             values = np.concatenate(
-                [
-                    interacted(
-                        t,
-                        panel_train.features[panel_train.alive[:, t], t],
-                        panel_train.cum_tokens[panel_train.alive[:, t], t],
-                    )
-                    for t in range(panel_train.t_max)
-                ]
+                [interacted(t, features, tokens) for t, (features, tokens) in enumerate(states)]
             )
             scale = float(values.std())
             if scale == 0:
@@ -166,9 +182,8 @@ def build_basis(
 def basis_martingales(panel: PayoffPanel, basis: PathwiseBasis) -> np.ndarray:
     """Return cumulative martingales of shape (J, N, T), starting at zero."""
     result = np.zeros((len(basis.value_fns), panel.n_traces, panel.t_max))
-    for j, fn in enumerate(basis.value_fns):
-        increments = martingale_increments(panel, fn)
-        result[j, :, 1:] = np.cumsum(increments[:, :-1], axis=1)
+    increments = martingale_increments_many(panel, basis.value_fns)
+    result[:, :, 1:] = np.cumsum(increments[:, :, :-1], axis=2)
     return result
 
 

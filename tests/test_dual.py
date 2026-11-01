@@ -6,6 +6,7 @@ from osc.stopping.dual import (
     cross_fit_shrunk_dual,
     dual_upper_bound,
     martingale_increments,
+    martingale_increments_many,
     scaled_value_fn,
     zero_value_fn,
 )
@@ -159,3 +160,23 @@ def test_per_fold_refitters_are_used_for_their_own_fold():
     for bad in [[refitter(0)], [refitter(0), "not callable"]]:
         with pytest.raises(DualError, match="one callable per fold"):
             cross_fit_shrunk_dual(panel, folds, [zero_value_fn] * 2, bad)
+
+
+def test_many_matches_single_increments():
+    model = default_model()
+    panel = build_panel(sample_traceset(model, 40, 3, 5), 0.05)
+    fns = (zero_value_fn, exact_state_value_fn(model, 0.05), lambda t, x, k: x[:, 0] * t)
+    many = martingale_increments_many(panel, fns)
+    assert many.shape == (3, *panel.payoff.shape)
+    for j, fn in enumerate(fns):
+        np.testing.assert_allclose(many[j], martingale_increments(panel, fn), atol=1e-12)
+        manual = np.zeros_like(panel.payoff)
+        for i, trace in enumerate(panel.traces):
+            for t in range(trace.n_steps - 1):
+                sibling = trace.siblings[t]
+                tokens = panel.cum_tokens[i, t] + sibling.step_tokens
+                inner = fn(t + 1, sibling.features, tokens).mean()
+                outer = fn(t + 1, panel.features[[i], t + 1], panel.cum_tokens[[i], t + 1])[0]
+                manual[i, t] = outer - inner
+        np.testing.assert_allclose(many[j], manual, atol=1e-12)
+    assert martingale_increments_many(panel, ()).shape == (0, *panel.payoff.shape)

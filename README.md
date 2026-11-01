@@ -49,7 +49,8 @@ python scripts/pilot_flips.py  --traces data/traces/r1d7b-math500/merged --probl
 python scripts/pilot_elicit.py --traces data/traces/r1d7b-math500/merged --problems problems.jsonl --model ... --out results/elicit.json
 ```
 
-Tests: `pytest -q --cov` (coverage gate 80%).
+Tests: `pytest -q --cov` (coverage gate 80%). Large-sample statistical checks are
+marked `slow` and skipped by default; run them with `pytest -m slow`.
 
 ## Status (2026-10-31)
 

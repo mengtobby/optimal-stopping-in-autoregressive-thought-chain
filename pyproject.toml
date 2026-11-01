@@ -19,7 +19,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-markers = ["model: needs torch/transformers and model weights (skipped by default)"]
+addopts = ["-m", "not slow"]
+markers = [
+    "model: needs torch/transformers and model weights (skipped by default)",
+    "slow: large-sample statistical checks (skipped by default; run with -m slow)",
+]
 
 [tool.coverage.run]
 source = ["osc"]
