@@ -4,6 +4,7 @@ Research code for measuring how much "overthinking" in reasoning models can be r
 
 - [docs/research-ideas.md](docs/research-ideas.md): candidate ideas, the prior work they were checked against, and the chosen direction.
 - [docs/results-run1.md](docs/results-run1.md): first real-trace results (math500, R1-Distill-Qwen-1.5B) and what changed for run 2.
+- [docs/results-run2.md](docs/results-run2.md): denser siblings; why sample size now limits the bounds.
 - [docs/cloud.md](docs/cloud.md): running collection and analysis on free Kaggle/Colab GPUs.
 
 ## What is here
@@ -52,11 +53,16 @@ python scripts/pilot_elicit.py --traces data/traces/r1d7b-math500/merged --probl
 Tests: `pytest -q --cov` (coverage gate 80%). Large-sample statistical checks are
 marked `slow` and skipped by default; run them with `pytest -m slow`.
 
-## Status (2026-10-31)
+## Status (2026-11-02)
 
 - Core bounds, baselines, collection and pilots are implemented and tested on synthetic data.
 - Run 1 (97 math500 traces, free Kaggle T4) is analysed in [docs/results-run1.md](docs/results-run1.md):
   - Hindsight stopping would reach 83% accuracy with 65% fewer tokens, against 76% for full traces.
   - No implementable policy beats finishing yet.
   - The regularized dual bounds fall back to hindsight because 2 siblings every 4th step are too noisy.
-- Run 2 (4 siblings every 2nd step, 3072 thinking tokens) is the test of whether the dual becomes informative.
+- Run 2 (41 traces, 4 siblings every 2nd step) is analysed in [docs/results-run2.md](docs/results-run2.md):
+  - Denser siblings let some martingale signal through, but the bound is still not below hindsight.
+  - With about 0.06 standard error, sample size is now the limit.
+  - The correctness probe is the only policy that beats finishing (at λ = 0.05 and 0.1).
+- Next: a sibling-free collection of about 300 problems (`notebooks/kaggle_pilots.ipynb`) for
+  signal-aware policies and the pilots.
