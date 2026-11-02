@@ -271,7 +271,7 @@ def test_passthrough_preserves_signal_and_default_behavior():
         fit_lsm(panel, LSMConfig(passthrough=4))
 
 
-@pytest.mark.parametrize("passthrough", [-1, 1.5])
+@pytest.mark.parametrize("passthrough", [-1, 1.5, True])
 def test_invalid_passthrough(passthrough):
     with pytest.raises(ValueError, match="passthrough"):
         LSMConfig(passthrough=passthrough)

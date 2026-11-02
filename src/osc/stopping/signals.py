@@ -14,7 +14,17 @@ if TYPE_CHECKING:
     from osc.stopping.payoff import PayoffPanel
 
 
+def _has_top_level_comma(text: str) -> bool:
+    depth = 0
+    for char in text:
+        depth += (char in "([{") - (char in ")]}")
+        if char == "," and depth == 0:
+            return True
+    return False
+
+
 def _strip_outer(answer: str) -> str:
+    """Drop redundant wrapping brackets; tuples and intervals keep theirs, so (0,1) != [0,1]."""
     answer = answer.strip()
     pairs = {"(": ")", "[": "]"}
     while answer and answer[0] in pairs and answer[-1] == pairs[answer[0]]:
@@ -27,10 +37,16 @@ def _strip_outer(answer: str) -> str:
                     return answer
             if not stack and i < len(answer) - 1:
                 return answer
-        if stack:
+        if stack or _has_top_level_comma(answer[1:-1]):
             return answer
         answer = answer[1:-1].strip()
     return answer
+
+
+def _canonical(answer: str) -> str:
+    """Bare comma lists read as tuples: '3, x' matches '(3, x)' but not '[3, x]'."""
+    stripped = _strip_outer(answer)
+    return _strip_outer(f"({stripped})") if _has_top_level_comma(stripped) else stripped
 
 
 def semantic_answer_ids(answers: Sequence[str | None]) -> tuple[int, ...]:
@@ -40,7 +56,7 @@ def semantic_answer_ids(answers: Sequence[str | None]) -> tuple[int, ...]:
     for answer in answers:
         if answer is not None and not isinstance(answer, str):
             raise TypeError("answers must contain strings or None")
-        normalized = _strip_outer(answer) if answer is not None else ""
+        normalized = _canonical(answer) if answer is not None else ""
         if not normalized:
             ids.append(-1)
             continue

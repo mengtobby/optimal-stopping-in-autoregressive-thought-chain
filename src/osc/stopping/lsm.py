@@ -28,7 +28,11 @@ class LSMConfig:
     passthrough: int = 0
 
     def __post_init__(self) -> None:
-        if not isinstance(self.passthrough, int) or self.passthrough < 0:
+        if (
+            not isinstance(self.passthrough, int)
+            or isinstance(self.passthrough, bool)
+            or self.passthrough < 0
+        ):
             raise LSMError("passthrough must be a non-negative integer")
         if self.n_components is not None and (
             not isinstance(self.n_components, int) or self.n_components < 1

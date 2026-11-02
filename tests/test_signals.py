@@ -27,6 +27,9 @@ def test_semantic_ids():
         (None, " ", "[(0.5)]", r"\frac{1}{2}", "(1)+(2)", "1)+(2", "[3)")
     ) == (-1, -1, 0, 0, 1, 2, 3)
     assert semantic_answer_ids(("((", "()", "([3)]")) == (0, -1, 1)
+    # Bracket type is part of tuples and intervals: open, closed, then the open one again.
+    assert semantic_answer_ids(("(0,1)", "[0,1]", " (0, 1) ", "[(0,1)]", "0, 1")) == (0, 1, 0, 0, 0)
+    assert semantic_answer_ids(("[0,1]", "0,1", "(0,1)")) == (0, 1, 1)
     with pytest.raises(TypeError):
         semantic_answer_ids((3,))
 

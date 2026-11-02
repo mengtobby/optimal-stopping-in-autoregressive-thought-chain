@@ -212,7 +212,8 @@ def headroom_report(
     signal_times, _, signal_folds = cross_fit_lsm(
         sig_panel, replace(lsm_config, passthrough=len(names)), n_folds, seed
     )
-    assert np.array_equal(signal_folds, folds)
+    if not np.array_equal(signal_folds, folds):
+        raise HeadroomError("signal policies must share the plain policies' folds")
     add("LSM-signals-cross-fit", "learned", signal_times)
     signal_probe_times = np.empty(len(traces), dtype=int)
     for fold in range(n_folds):

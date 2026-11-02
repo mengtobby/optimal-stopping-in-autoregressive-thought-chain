@@ -261,7 +261,8 @@ class HFBackend:
         if options["do_sample"]:
             options.update(temperature=self.temperature, top_p=self.top_p)
         if scored:
-            options.update(output_scores=True, return_dict_in_generate=True)
+            # Raw logits score the model's own probabilities, not the temperature/top-p warped ones.
+            options.update(output_logits=True, return_dict_in_generate=True)
         # Greedy generation cannot return multiple sequences; repeat its identical result.
         count = n_samples if options["do_sample"] else 1
         with self.torch.inference_mode():
@@ -281,7 +282,7 @@ class HFBackend:
         if scored:
             with self.torch.inference_mode():
                 scores = self.model.compute_transition_scores(
-                    sequences, output.scores, normalize_logits=True
+                    sequences, output.logits, normalize_logits=True
                 )
             answers = [
                 (answer, self._answer_confidence(row[encoded.input_ids.shape[1] :], score))
@@ -290,8 +291,14 @@ class HFBackend:
         return answers if options["do_sample"] else answers * n_samples
 
     def _answer_confidence(self, token_ids, transition_scores) -> float:
-        """Include the token closing the pre-opened box, including nested braces."""
+        """Include the token closing the pre-opened box, including nested braces.
+
+        An unclosed box is scored up to the first EOS; later positions are batch padding.
+        """
         count = len(transition_scores)
+        eos = getattr(self.tokenizer, "eos_token_id", None)
+        if eos is not None:
+            count = next((i + 1 for i, t in enumerate(token_ids[:count]) if t == eos), count)
         for end in range(1, count + 1):
             text = self.tokenizer.decode(token_ids[:end], skip_special_tokens=True)
             depth = 1

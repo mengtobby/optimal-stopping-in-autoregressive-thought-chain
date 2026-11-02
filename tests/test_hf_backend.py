@@ -394,13 +394,13 @@ def test_scored_generation_without_model():
     def generate(**kwargs):
         calls.append(kwargs)
         sequences = np.tile([9, 9, 1, 2, 3], (kwargs["num_return_sequences"], 1))
-        if kwargs.get("output_scores"):
-            assert kwargs["return_dict_in_generate"]
-            return SimpleNamespace(sequences=sequences, scores="scores")
+        if kwargs.get("output_logits"):
+            assert kwargs["return_dict_in_generate"] and "output_scores" not in kwargs
+            return SimpleNamespace(sequences=sequences, logits="logits")
         return sequences
 
     def transition(sequences, scores, normalize_logits):
-        assert scores == "scores" and normalize_logits
+        assert scores == "logits" and normalize_logits
         return np.tile(np.log([0.25, 1, 0.01]), (len(sequences), 1))
 
     backend = HFBackend.__new__(HFBackend)
@@ -412,7 +412,7 @@ def test_scored_generation_without_model():
     backend._prompt = lambda prompt: prompt
     backend.temperature, backend.top_p = 0.6, 0.95
     assert backend.force_answers("q", "", 2) == [r"\boxed{1}tail"] * 2
-    assert "output_scores" not in calls[-1]
+    assert "output_logits" not in calls[-1]
     assert backend.force_answers_scored("q", "", 2) == [(r"\boxed{1}tail", 0.5)] * 2
     assert calls[-1]["num_return_sequences"] == 2
     backend.temperature = 0
@@ -434,3 +434,20 @@ def test_answer_confidence_invalid_and_zero_probability():
     for scores in ([], [0.1], [float("nan")]):
         with pytest.raises(BackendError):
             backend._answer_confidence([1], scores)
+
+
+def test_unclosed_answer_confidence_stops_at_eos():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from osc.collect.hf_backend import HFBackend
+
+    backend = HFBackend.__new__(HFBackend)
+    backend.tokenizer = SimpleNamespace(
+        eos_token_id=0, decode=lambda ids, **kw: "".join("x" if i else "" for i in ids)
+    )
+    scores = np.array([-1.0, -2.0, -3.0, float("-inf")])
+    # The EOS token itself is scored; the padding after it is not.
+    assert backend._answer_confidence([5, 6, 0, 0], scores) == pytest.approx(np.exp(-2.0))
+    assert backend._answer_confidence([5, 6, 7], scores[:3]) == pytest.approx(np.exp(-2.0))
