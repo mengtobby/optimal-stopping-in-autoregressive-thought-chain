@@ -76,6 +76,33 @@ predicted finishing point recedes by about 0.9 steps per step taken. Both runs s
 uncensored traces to support a claim. The flips pilot runs end to end now, but 5 events give it no
 power.
 
+## Re-analysis with answer signals (runs 1 and 2)
+
+The signals round (`f066ad3`, `2b0d809`) adds four answer-stability signals to the LSM and the
+correctness probe, which bypass PCA:
+- `stable_run`: steps the current answer has been unchanged.
+- `agree_past`: share of earlier answers that agree with the current one.
+- `n_distinct`: distinct answers so far.
+- `has_answer`: whether the state has an answer.
+
+Answers are matched by mathematical equivalence. Runs 1 and 2 have no forced-answer agreement or
+confidence, so only these four signals were available. Results are in `results/*/rerun-r11/`.
+
+| Run, λ | Full trace | LSM | LSM + signals | Probe | Probe + signals |
+|---|---:|---:|---:|---:|---:|
+| Run 1, 0 | 0.763 | 0.763 | 0.763 | 0.722 | 0.747 |
+| Run 1, 0.05 | 0.680 | 0.680 | 0.675 | 0.666 | 0.681 |
+| Run 1, 0.1 | 0.596 | 0.592 | 0.592 | 0.606 | 0.602 |
+| Run 2, 0 | 0.744 | 0.707 | 0.720 | 0.720 | 0.707 |
+| Run 2, 0.05 | 0.644 | 0.619 | 0.623 | 0.661 | 0.644 |
+| Run 2, 0.1 | 0.545 | 0.517 | 0.525 | 0.580 | 0.582 |
+
+The signals change values by at most 0.025, well inside the intervals (about ±0.08 in run 1 and
+±0.13 in run 2). Answer stability alone does not make early stopping pay. This agrees with the
+run 1 table, which shows that finishing still adds about 9 points after 5+ stable steps. The
+untested signals are agreement and confidence across forced-answer samples, which the next
+collection records.
+
 ## Next steps
 
 1. **Collect many more problems without siblings.** The signals round (`kaggle_pilots.ipynb`)
