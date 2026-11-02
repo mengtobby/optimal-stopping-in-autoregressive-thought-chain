@@ -99,6 +99,56 @@ def test_signal_policies_preserve_plain_duals():
     assert "sibling states carry no answers" in markdown
 
 
+def test_signal_columns_survive_nested_fits(monkeypatch):
+    import osc.analysis.headroom as headroom
+    import osc.stopping.lsm as lsm
+    from osc.stopping.payoff import build_panel
+
+    traces = sample_traceset(default_model(), 16, 0, 19)
+    traces = replace(
+        traces,
+        traces=tuple(replace(trace, features=trace.features[:, :1]) for trace in traces),
+    )
+    panel = build_panel(traces, 0.05)
+    sig_panel, names = headroom._with_policy_signals(panel)
+    expected_dim = 1 + len(names)
+    indices = [0, 2, 5]
+    subset = sig_panel.subset(indices)
+    np.testing.assert_array_equal(subset.features, sig_panel.features[indices, : subset.t_max])
+    nested = subset.subset([1])
+    np.testing.assert_array_equal(nested.features, subset.features[[1], : nested.t_max])
+    assert nested.features.shape[-1] == expected_dim
+    assert not nested.features.flags.writeable
+    assert nested.t_max == nested.traces.max_steps
+    fitted_lsm_dims = []
+    fitted_probe_dims = []
+    original_lsm = lsm.fit_lsm
+    original_probe = headroom.fit_correctness_probe
+
+    def checked_lsm(train, config):
+        policy = original_lsm(train, config)
+        if config.passthrough:
+            fitted_lsm_dims.append(policy.feature_dim)
+            assert config.passthrough == len(names)
+        return policy
+
+    def checked_probe(train, **kwargs):
+        probe = original_probe(train, **kwargs)
+        if kwargs.get("passthrough"):
+            fitted_probe_dims.append(probe.feature_dim)
+            assert kwargs["passthrough"] == len(names)
+        return probe
+
+    monkeypatch.setattr(lsm, "fit_lsm", checked_lsm)
+    monkeypatch.setattr(headroom, "fit_correctness_probe", checked_probe)
+    report = headroom_report(traces, 0.05, n_folds=2, lsm_config=FAST_LSM)
+    assert report.signal_names == names
+    # Two outer fits and their inner fits must all retain the appended columns.
+    assert len(fitted_lsm_dims) > 2
+    assert set(fitted_lsm_dims) == {expected_dim}
+    assert fitted_probe_dims == [expected_dim, expected_dim]
+
+
 @pytest.mark.slow
 def test_synthetic_bounds_and_rendering():
     model = default_model()

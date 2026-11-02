@@ -73,6 +73,42 @@ class HeadroomReport:
 _DEFAULT_LSM_CONFIG = LSMConfig()
 
 
+@dataclass(frozen=True)
+class _SignalPanel(PayoffPanel):
+    """Keep policy feature columns through outer and nested training subsets."""
+
+    def subset(self, indices: np.ndarray | list[int]) -> PayoffPanel:
+        base = super().subset(indices)
+        features = self.features[np.asarray(indices, dtype=np.int64), : base.t_max]
+        features.setflags(write=False)
+        return replace(
+            self,
+            traces=base.traces,
+            horizons=base.horizons,
+            payoff=base.payoff,
+            accuracy=base.accuracy,
+            cum_tokens=base.cum_tokens,
+            answer_ids=base.answer_ids,
+            features=features,
+        )
+
+
+def _with_policy_signals(panel: PayoffPanel) -> tuple[PayoffPanel, tuple[str, ...]]:
+    """Adapt signal panels locally while PayoffPanel.subset rebuilds raw features."""
+    sig_panel, names = with_signals(panel)
+    return _SignalPanel(
+        traces=sig_panel.traces,
+        lam=sig_panel.lam,
+        token_scale=sig_panel.token_scale,
+        horizons=sig_panel.horizons,
+        payoff=sig_panel.payoff,
+        accuracy=sig_panel.accuracy,
+        cum_tokens=sig_panel.cum_tokens,
+        features=sig_panel.features,
+        answer_ids=sig_panel.answer_ids,
+    ), names
+
+
 def _lsm_refitter(config: LSMConfig, alpha: float) -> Callable[[PayoffPanel], ValueFn]:
     """Refit with the outer fold's selected alpha, so shrinkage suits that value fn."""
     tuned = replace(config, ridge_alpha=alpha)
@@ -172,7 +208,7 @@ def headroom_report(
     add("correctness-probe-cross-fit", "learned", probe_times)
     add("LSM-cross-fit", "learned", lsm_times)
     lower = rows[-1].value
-    sig_panel, names = with_signals(panel)
+    sig_panel, names = _with_policy_signals(panel)
     signal_times, _, signal_folds = cross_fit_lsm(
         sig_panel, replace(lsm_config, passthrough=len(names)), n_folds, seed
     )
