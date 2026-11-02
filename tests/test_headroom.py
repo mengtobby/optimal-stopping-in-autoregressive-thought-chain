@@ -46,6 +46,59 @@ def test_small_bounds_and_rendering():
     _check_rendering(report, 200)
 
 
+def test_signal_policies_preserve_plain_duals():
+    from osc.stopping.dual import cross_fit_shrunk_dual
+    from osc.stopping.lsm import cross_fit_lsm, fit_lsm
+    from osc.stopping.payoff import build_panel
+    from osc.stopping.signals import with_signals
+
+    traces = sample_traceset(default_model(), 30, 2, 11)
+    report = headroom_report(
+        traces, 0.05, n_folds=2, seed=11, lsm_config=FAST_LSM, pathwise_config=FAST_PATHWISE
+    )
+    panel = build_panel(traces, 0.05)
+    _, names = with_signals(panel)
+    assert report.signal_names == names
+    assert names
+    for method in ("LSM-signals-cross-fit", "correctness-probe-signals-cross-fit"):
+        row = next(row for row in report.rows if row.method == method)
+        assert row.family == "learned"
+        assert np.isfinite([row.value, *row.value_ci, row.accuracy, row.mean_tokens]).all()
+    times, policies, folds = cross_fit_lsm(panel, FAST_LSM, 2, 11)
+    assert report.lsm_lower == pytest.approx(panel.payoff[np.arange(len(traces)), times].mean())
+    dual, shrink = cross_fit_shrunk_dual(
+        panel,
+        folds,
+        [policy.value for policy in policies],
+        fit_value_fn=[
+            lambda train, alpha=policy.payoff_model.alpha: (
+                fit_lsm(train, replace(FAST_LSM, ridge_alpha=alpha)).value
+            )
+            for policy in policies
+        ],
+        seed=11,
+    )
+    assert report.dual_lsm_upper == pytest.approx(dual.per_trace.mean())
+    assert report.lsm_shrink == shrink
+    anchors = [
+        [
+            ("lsm_value", policy.value),
+            ("lsm_payoff", policy.payoff_estimate),
+            ("lsm_continuation", policy.continuation),
+        ]
+        for policy in policies
+    ]
+    pathwise, _ = cross_fit_pathwise_dual(panel, folds, anchors, FAST_PATHWISE)
+    assert report.dual_upper == pytest.approx(pathwise.per_trace.mean())
+    best = max(row.value for row in report.rows if row.family in ("heuristic", "learned"))
+    assert report.headroom == report.upper_bound - best
+    data = json.loads(json.dumps(report_to_json(report), allow_nan=False))
+    assert data["signal_names"] == list(names)
+    markdown = report_to_markdown(report)
+    assert all(name in markdown for name in names)
+    assert "sibling states carry no answers" in markdown
+
+
 @pytest.mark.slow
 def test_synthetic_bounds_and_rendering():
     model = default_model()
@@ -57,7 +110,7 @@ def test_synthetic_bounds_and_rendering():
 
 def test_no_siblings_and_validation():
     traces = sample_traceset(default_model(), 30, 0, 3)
-    report = headroom_report(traces, 0.05)
+    report = headroom_report(traces, 0.05, lsm_config=FAST_LSM)
     assert np.isnan(report.headroom_paired)
     assert report_to_json(report)["headroom_paired_ci"] == [None, None]
     assert np.isnan(report.dual_upper)
@@ -77,11 +130,26 @@ def test_no_siblings_and_validation():
         headroom_report(traces, 0.05, convergence_ks=(0,))
 
 
-def test_cli(tmp_path):
+def test_cli(tmp_path, monkeypatch):
     script = Path(__file__).resolve().parents[1] / "scripts" / "headroom.py"
     spec = importlib.util.spec_from_file_location("headroom_cli", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+
+    def fast_report(*args, **kwargs):
+        config = kwargs["pathwise_config"]
+        return headroom_report(
+            *args,
+            **{
+                **kwargs,
+                "lsm_config": FAST_LSM,
+                "pathwise_config": replace(
+                    config, l1_penalties=FAST_PATHWISE.l1_penalties, inner_folds=2
+                ),
+            },
+        )
+
+    monkeypatch.setattr(module, "headroom_report", fast_report)
     assert module.main(["--synthetic", "120", "--lam", "0.05", "--out", str(tmp_path)]) == 0
     data = json.loads((tmp_path / "report_lam0.05.json").read_text())
     assert data["exact_value"] == exact_value(default_model(), 0.05)
@@ -129,15 +197,22 @@ def test_paired_headroom_and_exact_row():
     )
     clusters = [trace.problem_id for trace in traces]
     exact_times = exact_optimal_stop_times(model, 0.05, traces)
-    report = headroom_report(traces, 0.05, seed=8, exact_stop_times=exact_times)
+    report = headroom_report(
+        traces,
+        0.05,
+        seed=8,
+        exact_stop_times=exact_times,
+        lsm_config=FAST_LSM,
+        pathwise_config=FAST_PATHWISE,
+    )
     panel = build_panel(traces, 0.05)
-    times, policies, folds = cross_fit_lsm(panel, seed=8)
+    times, policies, folds = cross_fit_lsm(panel, FAST_LSM, seed=8)
     differences = np.empty(len(traces))
     shrunk, shrink = cross_fit_shrunk_dual(
         panel,
         folds,
         [p.value for p in policies],
-        fit_value_fn=lambda train: fit_lsm(train).value,
+        fit_value_fn=lambda train: fit_lsm(train, FAST_LSM).value,
         seed=8,
     )
     assert report.lsm_shrink == shrink
@@ -167,7 +242,7 @@ def test_paired_headroom_and_exact_row():
         ]
         for policy in policies
     ]
-    result, _ = cross_fit_pathwise_dual(panel, folds, anchors)
+    result, _ = cross_fit_pathwise_dual(panel, folds, anchors, FAST_PATHWISE)
     dual_values = result.per_trace
     differences = dual_values - panel.payoff[np.arange(len(traces)), times]
     assert report.headroom_paired == pytest.approx(differences.mean())
