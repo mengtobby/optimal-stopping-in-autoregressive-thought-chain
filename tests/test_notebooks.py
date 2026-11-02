@@ -57,3 +57,40 @@ def test_cloud_run_settings(platform: str, limit: str, hours: str, workdirs: lis
     docs = (ROOT / "docs" / "cloud.md").read_text()
     for workdir in workdirs:
         assert f"`{workdir}`" in docs
+
+
+def test_kaggle_pilot_settings() -> None:
+    notebook = json.loads((ROOT / "notebooks" / "kaggle_pilots.ipynb").read_text())
+    original = json.loads((ROOT / "notebooks" / "kaggle_run.ipynb").read_text())
+    assert notebook["nbformat"] == 4
+    ids = [cell["id"] for cell in notebook["cells"]]
+    assert len(ids) == len(set(ids)) == 6
+    assert set(ids).isdisjoint(cell["id"] for cell in original["cells"])
+    assert notebook["cells"][2]["source"] == original["cells"][2]["source"]
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            ast.parse("".join(cell["source"]))
+    run = ast.parse("".join(notebook["cells"][4]["source"]))
+    command = run.body[0].value
+    assert isinstance(command, ast.List)
+    assert ast.literal_eval(command.elts[1]) == "scripts/run_pipeline.py"
+    assert ast.literal_eval(command.elts[2]) == "--workdir"
+    assert ast.unparse(command.elts[3]) == "str(workdir)"
+    arguments = [ast.literal_eval(item) for item in command.elts[4:]]
+    assert dict(zip(arguments[::2], arguments[1::2], strict=True)) == {
+        "--model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        "--dataset": "math500",
+        "--limit": "300",
+        "--max-hours": "11",
+        "--dtype": "float16",
+        "--n-forced": "4",
+        "--k-siblings": "0",
+        "--max-thinking-tokens": "3072",
+        "--max-steps": "20",
+    }
+    setup = ast.parse("".join(notebook["cells"][3]["source"]))
+    assert ast.literal_eval(setup.body[0].value.args[0]) == (
+        "/kaggle/working/osc-runs/math500-pilots"
+    )
+    docs = (ROOT / "docs" / "cloud.md").read_text()
+    assert "`/kaggle/working/osc-runs/math500-pilots`" in docs

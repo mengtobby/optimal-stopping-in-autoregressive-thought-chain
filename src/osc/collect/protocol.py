@@ -45,6 +45,16 @@ class ReasoningBackend(Protocol):
         final-answer completions (raw text, to be parsed by the caller)."""
         ...
 
+    def force_answers_scored(
+        self, prompt: str, thinking_prefix: str, n_samples: int
+    ) -> list[tuple[str, float]]:
+        """Return raw answers and confidence in [0, 1] for each sample.
+
+        Confidence is exp(mean generated-token log-probability), through the token
+        closing the boxed answer, or all generated tokens if the box never closes.
+        """
+        ...
+
     def continue_steps(
         self, prompt: str, thinking_prefix: str, k: int, max_tokens: int
     ) -> list[str]:

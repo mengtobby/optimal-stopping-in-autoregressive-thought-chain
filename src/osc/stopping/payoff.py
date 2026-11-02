@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from osc.data.schema import TraceSet
+from osc.stopping.signals import semantic_answer_ids
 
 
 class PanelError(ValueError):
@@ -80,10 +81,7 @@ def build_panel(traces: TraceSet, lam: float, token_scale: float = 1000.0) -> Pa
         accuracy[i, :h] = tr.forced_correct
         cum_tokens[i, :h] = tr.cum_tokens
         features[i, :h] = tr.features
-        codes: dict[str, int] = {}
-        for t, ans in enumerate(tr.forced_answers):
-            if ans is not None and ans.strip():
-                answer_ids[i, t] = codes.setdefault(ans.strip(), len(codes))
+        answer_ids[i, :h] = semantic_answer_ids(tr.forced_answers)
     payoff = accuracy - lam * cum_tokens / token_scale
     return PayoffPanel(
         traces=traces,

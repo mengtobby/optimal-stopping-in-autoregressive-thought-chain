@@ -101,6 +101,28 @@ every 2nd step and a 3072-token thinking budget. The collector's deadline stops
 starting problems at ~8.25 h, so fewer than 60 may finish, which is expected.
 The fresh `math500-r2` workdirs keep these settings separate from run 1.
 
+## Pilot run (no siblings)
+
+Import `notebooks/kaggle_pilots.ipynb` for the flips (Idea 2) and elicitation
+(Idea 3) pilots and signal-aware stopping policies. It uses the same Kaggle
+clone/install setup and model, with a separate workdir
+`/kaggle/working/osc-runs/math500-pilots`:
+
+```bash
+python scripts/run_pipeline.py --workdir /kaggle/working/osc-runs/math500-pilots \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --dataset math500 \
+  --limit 300 --max-hours 11 --dtype float16 \
+  --n-forced 4 --k-siblings 0 --max-thinking-tokens 3072 --max-steps 20
+```
+
+Correct-to-wrong flips occur in roughly 5% of traces (5/97 in Run 1), so the
+pilots need several hundred problems. Siblings dominate runtime; omitting them
+leaves more time for problems and four forced answer samples per step. This run
+provides no dual bound: headroom still reports policy results and explicitly
+notes that the dual upper bound is unavailable without siblings. The collection
+deadline may stop before 300 problems; downstream pilots use the completed traces.
+Check the session limit and lower the budget as described above.
+
 ## Resume and retrieve results
 
 Rerun the same command or notebook with the same workdir. Collection resumes from

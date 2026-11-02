@@ -246,3 +246,32 @@ def test_nested_selection_uses_only_training_problem_groups(monkeypatch):
     _, _, folds = cross_fit_lsm(panel, n_folds=3)
     for fold, ids in enumerate(selected_ids):
         assert ids == {tr.problem_id for i, tr in enumerate(panel.traces) if folds[i] != fold}
+
+
+def test_passthrough_preserves_signal_and_default_behavior():
+    panel, _ = toy(80)
+    np.testing.assert_array_equal(
+        fit_lsm(panel).stop_times(panel),
+        fit_lsm(panel, LSMConfig(passthrough=0)).stop_times(panel),
+    )
+    from test_baselines import signal_panel
+
+    train, test = signal_panel(10), signal_panel(11)
+    compressed = fit_lsm(train, LSMConfig(n_components=1))
+    preserved = fit_lsm(train, LSMConfig(n_components=1, passthrough=1))
+    assert evaluate_stop_times(test, preserved.stop_times(test), "signals").value > (
+        evaluate_stop_times(test, compressed.stop_times(test), "pca").value + 0.1
+    )
+    assert preserved.value(0, test.features[:0, 0], test.cum_tokens[:0, 0]).shape == (0,)
+    all_signals = fit_lsm(train, LSMConfig(passthrough=train.features.shape[2]))
+    assert all_signals.pca is None
+    assert all_signals.scaler is None
+    assert np.isfinite(all_signals.value(0, test.features[:, 0], test.cum_tokens[:, 0])).all()
+    with pytest.raises(ValueError, match="passthrough"):
+        fit_lsm(panel, LSMConfig(passthrough=4))
+
+
+@pytest.mark.parametrize("passthrough", [-1, 1.5])
+def test_invalid_passthrough(passthrough):
+    with pytest.raises(ValueError, match="passthrough"):
+        LSMConfig(passthrough=passthrough)

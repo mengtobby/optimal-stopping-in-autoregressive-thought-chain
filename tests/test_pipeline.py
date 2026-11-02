@@ -273,3 +273,78 @@ def test_expired_deadline_without_shards(tmp_path, monkeypatch):
             tmp_path,
             deadline=10,
         )
+
+
+def test_answer_signals_and_legacy_backend():
+    import numpy as np
+
+    backend = FakeBackend(answers=(r"\boxed{1}", r"\boxed{1.0}", r"\boxed{2}"))
+    problem = Problem("signals", "q", "1", "test")
+    config = CollectConfig(n_forced=3, k_siblings=0, min_chars=0)
+    trace = collect_trace(backend, problem, config)
+    assert trace.forced_agreement.shape == (trace.n_steps,)
+    np.testing.assert_allclose(trace.forced_agreement, 2 / 3)
+    assert trace.forced_confidence.shape == (trace.n_steps,)
+    assert np.all((trace.forced_confidence >= 0.2) & (trace.forced_confidence <= 0.95))
+
+    class Legacy:
+        def __getattr__(self, name):
+            if name == "force_answers_scored":
+                raise AttributeError(name)
+            return getattr(backend, name)
+
+    legacy = collect_trace(Legacy(), problem, config)
+    assert legacy.forced_agreement is None
+    assert legacy.forced_confidence is None
+
+
+@pytest.mark.parametrize("samples", [[], [("unboxed", 0.5)]])
+def test_answer_signals_missing_answers(samples):
+    import numpy as np
+
+    class Missing(FakeBackend):
+        def force_answers_scored(self, prompt, thinking_prefix, n_samples):
+            return samples
+
+    trace = collect_trace(Missing(), Problem("a", "q", "1", "test"), CollectConfig(k_siblings=0))
+    assert (trace.forced_agreement == 0).all()
+    if samples:
+        assert (trace.forced_confidence == 0.5).all()
+    else:
+        assert np.isnan(trace.forced_confidence).all()
+
+
+def test_invalid_answer_confidence():
+    class Invalid(FakeBackend):
+        def force_answers_scored(self, prompt, thinking_prefix, n_samples):
+            return [(r"\boxed{1}", 1.1)]
+
+    with pytest.raises(CollectionError, match="invalid answer confidence"):
+        collect_trace(Invalid(), Problem("a", "q", "1", "test"), CollectConfig(k_siblings=0))
+
+
+def test_only_outer_states_use_scored_answers():
+    import numpy as np
+
+    class Recording(FakeBackend):
+        def __init__(self):
+            super().__init__(thinking="a", continuations=("b",))
+            self.scored_prefixes = []
+            self.unscored_prefixes = []
+
+        def force_answers_scored(self, prompt, thinking_prefix, n_samples):
+            self.scored_prefixes.append(thinking_prefix)
+            return [(r"\boxed{1}", 0.2), (r"\boxed{2}", 0.8)]
+
+        def force_answers(self, prompt, thinking_prefix, n_samples):
+            self.unscored_prefixes.append(thinking_prefix)
+            return super().force_answers(prompt, thinking_prefix, n_samples)
+
+    backend = Recording()
+    trace = collect_trace(
+        backend, Problem("a", "q", "1", "test"), CollectConfig(n_forced=2, k_siblings=2)
+    )
+    assert backend.scored_prefixes == ["", "a"]
+    assert backend.unscored_prefixes == ["b", "b"]
+    np.testing.assert_allclose(trace.forced_confidence, 0.5)
+    np.testing.assert_allclose(trace.forced_agreement, 0.5)
