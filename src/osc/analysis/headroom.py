@@ -29,6 +29,7 @@ from osc.stopping.prophet import (
     threshold_stop_times,
     time_threshold_stop_times,
 )
+from osc.stopping.signals import with_signals
 from osc.stopping.stats import cluster_bootstrap_mean_ci, cluster_standard_error
 
 
@@ -66,6 +67,7 @@ class HeadroomReport:
     lsm_shrink: tuple[float, ...] = ()
     upper_bound: float = float("nan")
     upper_bound_source: str = ""
+    signal_names: tuple[str, ...] = ()
 
 
 _DEFAULT_LSM_CONFIG = LSMConfig()
@@ -170,6 +172,29 @@ def headroom_report(
     add("correctness-probe-cross-fit", "learned", probe_times)
     add("LSM-cross-fit", "learned", lsm_times)
     lower = rows[-1].value
+    sig_panel, names = with_signals(panel)
+    signal_times, _, signal_folds = cross_fit_lsm(
+        sig_panel, replace(lsm_config, passthrough=len(names)), n_folds, seed
+    )
+    assert np.array_equal(signal_folds, folds)
+    add("LSM-signals-cross-fit", "learned", signal_times)
+    signal_probe_times = np.empty(len(traces), dtype=int)
+    for fold in range(n_folds):
+        test_indices = np.flatnonzero(folds == fold)
+        train_sig = sig_panel.subset(np.flatnonzero(folds != fold))
+        test_sig = sig_panel.subset(test_indices)
+        probe = fit_correctness_probe(train_sig, passthrough=len(names))
+        train_scores = probe.scores(train_sig)
+        thresholds = np.linspace(0, 1, 21).tolist() + [1.01]
+        threshold = select_param(
+            train_sig,
+            thresholds,
+            lambda p, c, scores=train_scores: probe_threshold_stop_times(p, scores, c),
+        )
+        signal_probe_times[test_indices] = probe_threshold_stop_times(
+            test_sig, probe.scores(test_sig), threshold
+        )
+    add("correctness-probe-signals-cross-fit", "learned", signal_probe_times)
     notes = ["Intervals condition on fitted policies; they do not include training uncertainty."]
     notes.append("Confidence intervals and dual standard errors are clustered by problem.")
     upper, se = float("nan"), float("nan")
@@ -177,6 +202,7 @@ def headroom_report(
     paired = float("nan")
     paired_ci = (float("nan"), float("nan"))
     lsm_shrink: tuple[float, ...] = ()
+    # Dual anchors stay features-only: sibling states carry no answer signals.
     if any(trace.has_siblings for trace in traces):
         lsm_dual, lsm_shrink = cross_fit_shrunk_dual(
             panel,
@@ -264,6 +290,7 @@ def headroom_report(
         lsm_shrink,
         upper_bound,
         upper_bound_source,
+        names,
     )
 
 
@@ -304,6 +331,10 @@ def report_to_markdown(report: HeadroomReport) -> str:
     lines.extend(
         [
             "",
+            "Answer signals: " + (", ".join(report.signal_names) or "N/A") + ".",
+            "Signal policies use answer stability and, when collected, trial-answer agreement "
+            "and confidence; dual bounds use hidden-state features only because sibling states "
+            "carry no answers.",
             f"Selected upper bound: {number(report.upper_bound)}. "
             f"Source: {report.upper_bound_source}.",
             "LSM shrink factors by fold: "
