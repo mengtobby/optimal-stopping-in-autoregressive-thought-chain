@@ -5,6 +5,7 @@ Research code for measuring how much "overthinking" in reasoning models can be r
 - [docs/research-ideas.md](docs/research-ideas.md): candidate ideas, the prior work they were checked against, and the chosen direction.
 - [docs/results-run1.md](docs/results-run1.md): first real-trace results (math500, R1-Distill-Qwen-1.5B) and what changed for run 2.
 - [docs/results-run2.md](docs/results-run2.md): denser siblings; why sample size now limits the bounds.
+- [docs/results-pilots.md](docs/results-pilots.md): forced-answer signals predict correctness but do not enable early stops; pilot results.
 - [docs/cloud.md](docs/cloud.md): running collection and analysis on free Kaggle/Colab GPUs.
 
 ## What is here
@@ -53,7 +54,7 @@ python scripts/pilot_elicit.py --traces data/traces/r1d7b-math500/merged --probl
 Tests: `pytest -q --cov` (coverage gate 80%). Large-sample statistical checks are
 marked `slow` and skipped by default; run them with `pytest -m slow`.
 
-## Status (2026-11-02)
+## Status (2026-11-03)
 
 - Core bounds, baselines, collection and pilots are implemented and tested on synthetic data.
 - Run 1 (97 math500 traces, free Kaggle T4) is analysed in [docs/results-run1.md](docs/results-run1.md):
@@ -64,5 +65,12 @@ marked `slow` and skipped by default; run them with `pytest -m slow`.
   - Denser siblings let some martingale signal through, but the bound is still not below hindsight.
   - With about 0.06 standard error, sample size is now the limit.
   - The correctness probe is the only policy that beats finishing (at λ = 0.05 and 0.1).
-- Next: a sibling-free collection of about 300 problems (`notebooks/kaggle_pilots.ipynb`) for
-  signal-aware policies and the pilots.
+- The pilots run (102 traces, 4 forced answers per state, no siblings) is analysed in
+  [docs/results-pilots.md](docs/results-pilots.md):
+  - Forced-answer confidence and agreement predict current correctness (AUROC 0.86 and 0.83).
+  - They still do not let a policy beat finishing: even when all forced answers agree, finishing
+    adds 11 points of accuracy.
+  - The receding-horizon slope of self-predicted remaining steps replicates (0.86, 0.88, 0.89).
+  - Attention before flips shows no effect (9 flips, AUROC 0.45).
+- Next: firm up Idea 3 (larger elicitation budget, clustered intervals) and store per-trace
+  payoffs in headroom reports for paired policy comparisons.
