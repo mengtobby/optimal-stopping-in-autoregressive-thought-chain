@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
@@ -46,6 +46,8 @@ class HeadroomRow:
     accuracy: float
     mean_tokens: float
     token_savings: float
+    stop_times: tuple[int, ...] = ()
+    payoffs: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,62 @@ class HeadroomReport:
     upper_bound: float = float("nan")
     upper_bound_source: str = ""
     signal_names: tuple[str, ...] = ()
+    problem_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PairedComparison:
+    method_a: str
+    method_b: str
+    mean_difference: float
+    ci: tuple[float, float]
+    n_traces: int
+
+
+def paired_comparison(
+    report: HeadroomReport | Mapping[str, Any],
+    method_a: str,
+    method_b: str,
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> PairedComparison:
+    """Compare saved per-trace payoffs with a problem-clustered paired interval."""
+    data = report_to_json(report) if isinstance(report, HeadroomReport) else report
+    clusters = data.get("problem_ids")
+    if not isinstance(clusters, (list, tuple)) or not clusters:
+        raise HeadroomError("missing problem_ids")
+    if any(not isinstance(cluster, str) for cluster in clusters):
+        raise HeadroomError("problem_ids must contain strings")
+    rows = data.get("rows", ())
+    if not isinstance(rows, (list, tuple)) or any(not isinstance(r, Mapping) for r in rows):
+        raise HeadroomError("rows must contain method mappings")
+    values = []
+    for method in (method_a, method_b):
+        matches = [row for row in rows if row.get("method") == method]
+        if not matches:
+            raise HeadroomError(f"unknown method: {method}")
+        if len(matches) != 1:
+            raise HeadroomError(f"duplicate method: {method}")
+        payoffs = matches[0].get("payoffs")
+        if not isinstance(payoffs, (list, tuple)) or not payoffs:
+            raise HeadroomError(f"method {method} has no payoffs")
+        if len(payoffs) != len(clusters) or len(payoffs) != data.get("n_traces"):
+            raise HeadroomError("payoffs, problem_ids and n_traces length mismatch")
+        try:
+            array = np.asarray(payoffs, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise HeadroomError(f"invalid payoffs for method {method}") from exc
+        if array.ndim != 1 or not np.isfinite(array).all():
+            raise HeadroomError(f"method {method} payoffs must be finite numbers")
+        values.append(array)
+    differences = values[0] - values[1]
+    return PairedComparison(
+        method_a,
+        method_b,
+        float(differences.mean()),
+        cluster_bootstrap_mean_ci(differences, clusters, n_boot=n_boot, seed=seed),
+        len(clusters),
+    )
 
 
 _DEFAULT_LSM_CONFIG = LSMConfig()
@@ -159,6 +217,8 @@ def headroom_report(
                 result.accuracy,
                 result.mean_tokens,
                 savings,
+                tuple(int(time) for time in times),
+                tuple(float(value) for value in values),
             )
         )
 
@@ -260,6 +320,7 @@ def headroom_report(
                 float("nan"),
                 float("nan"),
                 float("nan"),
+                payoffs=tuple(float(value) for value in values),
             )
         )
         anchors_by_fold = [
@@ -291,6 +352,7 @@ def headroom_report(
                 float("nan"),
                 float("nan"),
                 float("nan"),
+                payoffs=tuple(float(value) for value in values),
             )
         )
         notes.append("Dual accuracy and token usage are undefined because a bound is not a policy.")
@@ -328,6 +390,7 @@ def headroom_report(
         upper_bound,
         upper_bound_source,
         names,
+        tuple(clusters),
     )
 
 
@@ -365,6 +428,36 @@ def report_to_markdown(report: HeadroomReport) -> str:
             f"{number(row.accuracy)} | {number(row.mean_tokens)} | "
             f"{number(row.token_savings)} |"
         )
+    comparisons = [
+        row
+        for row in report.rows
+        if row.family in ("heuristic", "learned") and row.method != "full-trace"
+    ]
+    full = next((row for row in report.rows if row.method == "full-trace"), None)
+    if full is not None and full.payoffs and all(row.payoffs for row in comparisons):
+        if report.problem_ids:
+            lines.extend(
+                [
+                    "",
+                    "## Paired differences vs full-trace",
+                    "",
+                    "| Method | Mean difference | 95% CI |",
+                    "|---|---:|---|",
+                ]
+            )
+            for row in comparisons:
+                paired = paired_comparison(report, row.method, "full-trace")
+                lines.append(
+                    f"| {row.method} | {number(paired.mean_difference)} | "
+                    f"[{number(paired.ci[0])}, {number(paired.ci[1])}] |"
+                )
+            lines.extend(
+                [
+                    "",
+                    "Paired intervals resample problems jointly, so they are much narrower "
+                    "than comparing two marginal intervals.",
+                ]
+            )
     lines.extend(
         [
             "",

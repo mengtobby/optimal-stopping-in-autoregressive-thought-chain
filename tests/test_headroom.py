@@ -11,6 +11,7 @@ import pytest
 from osc.analysis.headroom import (
     HeadroomError,
     headroom_report,
+    paired_comparison,
     report_to_json,
     report_to_markdown,
 )
@@ -38,12 +39,62 @@ def _check_rendering(report, n_traces):
     assert data["rows"][-1]["accuracy"] is None
     best = max(r.value for r in report.rows if r.family in ("heuristic", "learned"))
     assert report.headroom == report.upper_bound - best
+    assert len(report.problem_ids) == n_traces
+    for row in report.rows:
+        assert len(row.payoffs) == n_traces
+        assert np.isclose(np.mean(row.payoffs), row.value)
+        assert len(row.stop_times) == (0 if row.family == "bound" else n_traces)
+        assert all(type(value) is float for value in row.payoffs)
+        assert all(type(time) is int for time in row.stop_times)
+    comparison = paired_comparison(report, "full-trace", "full-trace")
+    assert comparison.mean_difference == 0
+    assert comparison.ci == (0, 0)
+    assert paired_comparison(data, "full-trace", "full-trace") == comparison
+    assert paired_comparison(data, "correctness-probe-cross-fit", "full-trace") == (
+        paired_comparison(report, "correctness-probe-cross-fit", "full-trace")
+    )
+    assert data["problem_ids"] == list(report.problem_ids)
+    assert "## Paired differences vs full-trace" in markdown
+    assert "| correctness-probe-cross-fit |" in markdown
+    legacy = replace(report, rows=tuple(replace(row, payoffs=()) for row in report.rows))
+    assert "## Paired differences vs full-trace" not in report_to_markdown(legacy)
 
 
 def test_small_bounds_and_rendering():
     traces = sample_traceset(default_model(), 200, 2, 0)
     report = headroom_report(traces, 0.05, lsm_config=FAST_LSM, pathwise_config=FAST_PATHWISE)
     _check_rendering(report, 200)
+
+
+def test_paired_comparison_validation_and_clusters():
+    from osc.stopping.stats import cluster_bootstrap_mean_ci
+
+    data = {
+        "n_traces": 3,
+        "problem_ids": ["a", "a", "b"],
+        "rows": [
+            {"method": "a", "payoffs": [1.0, 2.0, 6.0]},
+            {"method": "b", "payoffs": [0.0, 1.0, 2.0]},
+        ],
+    }
+    comparison = paired_comparison(data, "a", "b", n_boot=100, seed=7)
+    assert comparison.mean_difference == 2
+    assert comparison.n_traces == 3
+    assert comparison.ci == cluster_bootstrap_mean_ci(
+        np.array([1.0, 1.0, 4.0]), data["problem_ids"], n_boot=100, seed=7
+    )
+    with pytest.raises(HeadroomError, match="unknown method"):
+        paired_comparison(data, "missing", "b")
+    for update, message in (
+        ({"problem_ids": []}, "missing problem_ids"),
+        ({"problem_ids": ["a"]}, "length mismatch"),
+        ({"n_traces": 4}, "length mismatch"),
+        ({"rows": [{"method": "a"}]}, "no payoffs"),
+        ({"rows": [{"method": "a", "payoffs": [None, 1, 2]}]}, "finite"),
+        ({"rows": [{"method": "a", "payoffs": ["bad", 1, 2]}]}, "invalid payoffs"),
+    ):
+        with pytest.raises(HeadroomError, match=message):
+            paired_comparison({**data, **update}, "a", "b")
 
 
 def test_signal_policies_preserve_plain_duals():
