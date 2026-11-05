@@ -90,6 +90,58 @@ def test_calibrated_and_receding_plans():
     assert np.isnan(consistency_stats([[np.nan]], [1]).mean_bias)
 
 
+def test_clustered_slope_interval():
+    rng = np.random.default_rng(42)
+    times = np.arange(7)
+    planned = 20 + (rng.normal(0.6, 0.3, 20)[:, None] - 1) * times
+    planned += rng.normal(0, 0.1, planned.shape)
+    planned[0, 4:] = np.nan
+    horizons = [7] * len(planned)
+    stats = consistency_stats(planned, horizons, n_boot=300, seed=17)
+    assert stats.receding_slope_ci[0] < stats.receding_slope < stats.receding_slope_ci[1]
+    assert (
+        stats.receding_slope_ci
+        == consistency_stats(planned, horizons, n_boot=300, seed=17).receding_slope_ci
+    )
+    excluded = consistency_stats(
+        np.vstack([planned, np.zeros(7)]),
+        horizons + [7],
+        censored=[False] * len(planned) + [True],
+        n_boot=300,
+        seed=17,
+    )
+    assert excluded.receding_slope_ci == stats.receding_slope_ci
+
+
+def test_slope_interval_matches_resampled_centered_pairs():
+    planned = np.array([[4, 3, 2, np.nan], [2, 3, 4, 5], [1, np.nan, np.nan, np.nan]])
+    rng = np.random.default_rng(8)
+    slopes = []
+    for _ in range(100):
+        xs, ys = [], []
+        for i in rng.integers(3, size=3):
+            t = np.flatnonzero(np.isfinite(planned[i]))
+            stop = t + planned[i, t]
+            xs.extend(t - t.mean())
+            ys.extend(stop - stop.mean())
+        if np.dot(xs, xs) > 0:
+            slopes.append(np.dot(xs, ys) / np.dot(xs, xs))
+    stats = consistency_stats(planned, [4] * 3, n_boot=100, seed=8)
+    np.testing.assert_allclose(stats.receding_slope_ci, np.percentile(slopes, [2.5, 97.5]))
+
+
+@pytest.mark.parametrize("planned", [[[2, 1]], [[np.nan, np.nan]], [[1], [2]]])
+def test_undefined_slope_interval(planned):
+    stats = consistency_stats(planned, [len(planned[0])] * len(planned), n_boot=10)
+    assert np.isnan(stats.receding_slope_ci).all()
+
+
+@pytest.mark.parametrize("n_boot", [0, -1, 1.5, True])
+def test_invalid_bootstrap_count(n_boot):
+    with pytest.raises(ElicitationError, match="n_boot"):
+        consistency_stats([[0]], [1], n_boot=n_boot)
+
+
 @pytest.mark.parametrize(
     "planned,horizons,tolerance",
     [
@@ -270,7 +322,12 @@ def test_cli_score_chunk_size(chunk_args, expected, tmp_path, monkeypatch):
     namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/pilot_elicit.py"))
     namespace["main"]()
     assert calls == [("fake-model", expected)]
-    assert json.loads(output.read_text(encoding="utf-8"))["n_elicitations"] == 4
+    payload = json.loads(
+        output.read_text(encoding="utf-8"),
+        parse_constant=lambda value: pytest.fail(f"non-finite JSON constant: {value}"),
+    )
+    assert payload["n_elicitations"] == 4
+    assert payload["receding_slope_ci"] == [None, None]
 
 
 @pytest.mark.parametrize(

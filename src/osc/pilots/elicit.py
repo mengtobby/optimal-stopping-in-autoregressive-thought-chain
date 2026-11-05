@@ -150,6 +150,7 @@ class ConsistencyStats:
     reversal_rate: float
     per_trace_slopes: np.ndarray
     n_excluded: int = 0
+    receding_slope_ci: tuple[float, float] = (float("nan"), float("nan"))
 
 
 def consistency_stats(
@@ -157,13 +158,19 @@ def consistency_stats(
     horizons: Sequence[int],
     tolerance: float = 1,
     censored: Sequence[bool] | None = None,
+    n_boot: int = 2000,
+    seed: int = 0,
 ) -> ConsistencyStats:
     """Analyze NaN-padded plans; parse_rate counts all in-horizon slots.
 
     Skipped and unparseable probes are indistinguishable in the public array format.
-    The slope SE is the usual homoskedastic OLS SE with trace intercepts removed.
+    The slope SE is the usual homoskedastic OLS SE with trace intercepts removed;
+    it ignores within-trace correlation. The percentile 95% slope interval resamples
+    whole traces (each a problem), preserving within-trace correlation.
     Censored rows are excluded from all statistics, including per_trace_slopes.
     """
+    if isinstance(n_boot, bool) or not isinstance(n_boot, (int, np.integer)) or n_boot < 1:
+        raise ElicitationError("n_boot must be a positive integer")
     values = np.asarray(planned, float)
     h = np.asarray(horizons)
     if values.ndim != 2 or h.shape != (len(values),):
@@ -188,6 +195,7 @@ def consistency_stats(
     realized = h[rows] - 1 - times
     slopes = np.full(len(values), np.nan)
     xs, ys = [], []
+    trace_xx, trace_xy = [], []
     groups = 0
     for i in range(len(values)):
         t = np.flatnonzero(valid[i]).astype(float)
@@ -195,6 +203,8 @@ def consistency_stats(
             groups += 1
             stop = t + values[i, valid[i]]
             x, y = t - t.mean(), stop - stop.mean()
+            trace_xx.append(float(np.dot(x, x)))
+            trace_xy.append(float(np.dot(x, y)))
             xs.extend(x.tolist())
             ys.extend(y.tolist())
             if t.size > 1:
@@ -208,6 +218,19 @@ def consistency_stats(
         if dof > 0:
             se = float(np.sqrt(np.sum((y - slope * x) ** 2) / dof / ss))
     correlation = float("nan")
+    slope_ci = (float("nan"), float("nan"))
+    if groups >= 2:
+        rng = np.random.default_rng(seed)
+        xx, xy = np.asarray(trace_xx), np.asarray(trace_xy)
+        bootstrap_slopes = []
+        for _ in range(n_boot):
+            indices = rng.integers(groups, size=groups)
+            denominator = float(xx[indices].sum())
+            if denominator > 0:
+                bootstrap_slopes.append(float(xy[indices].sum() / denominator))
+        if bootstrap_slopes:
+            low, high = np.percentile(bootstrap_slopes, [2.5, 97.5])
+            slope_ci = (float(low), float(high))
     if observed.size > 1 and np.ptp(observed) > 0 and np.ptp(realized) > 0:
         correlation = float(spearmanr(observed, realized).statistic)
     slopes.setflags(write=False)
@@ -222,6 +245,7 @@ def consistency_stats(
         float(np.mean(observed + tolerance < realized)) if observed.size else float("nan"),
         slopes,
         n_excluded,
+        slope_ci,
     )
 
 
