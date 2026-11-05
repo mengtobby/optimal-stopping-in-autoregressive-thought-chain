@@ -123,6 +123,15 @@ notes that the dual upper bound is unavailable without siblings. The collection
 deadline may stop before 300 problems; downstream pilots use the completed traces.
 Check the session limit and lower the budget as described above.
 
+## Idea 3 long-trace run
+
+Import `notebooks/kaggle_idea3.ipynb` for the elicitation pilot with workdir
+`/kaggle/working/osc-runs/math500-idea3`. It uses 300 math500 problems, an 11-hour
+budget, float16, one forced answer, no siblings, a 4096-token thinking budget,
+`--max-steps 64`, and `--elicit-max-k 64`. Longer traces aim to reduce censoring
+from the previous 20-step cap; the larger max-k makes long remaining-step counts
+expressible in the elicitation probe. Collection may stop before 300 problems.
+
 ## Resume and retrieve results
 
 Rerun the same command or notebook with the same workdir. Collection resumes from

@@ -61,6 +61,8 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--refresh-problems", action="store_true")
     result.add_argument("--score-chunk-size", type=int, default=8)
+    result.add_argument("--elicit-max-k", type=int, default=30)
+    result.add_argument("--elicit-every", type=int, default=1)
     defaults = CollectConfig()
     for name in CONFIG_FLAGS:
         result.add_argument(
@@ -332,7 +334,16 @@ def run_stage(stage: str, args: argparse.Namespace, remaining: float) -> None:
             str(stage_outputs(stage, args)[0]),
         ]
     if stage == "elicit":
-        command.extend(["--score-chunk-size", str(args.score_chunk_size)])
+        command.extend(
+            [
+                "--score-chunk-size",
+                str(args.score_chunk_size),
+                "--max-k",
+                str(args.elicit_max_k),
+                "--every",
+                str(args.elicit_every),
+            ]
+        )
     subprocess.run(command, check=True, timeout=remaining)
 
 
@@ -422,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
         cli.error("--keep-backups must be nonnegative")
     if args.score_chunk_size < 1:
         cli.error("--score-chunk-size must be positive")
+    if not 0 <= args.elicit_max_k <= 10000:
+        cli.error("--elicit-max-k must be in [0, 10000]")
+    if args.elicit_every < 1:
+        cli.error("--elicit-every must be positive")
     requested = args.stages.split(",")
     if any(stage not in STAGES for stage in requested) or len(set(requested)) != len(requested):
         cli.error("--stages must contain unique names from " + ",".join(STAGES))

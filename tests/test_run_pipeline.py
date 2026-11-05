@@ -120,7 +120,25 @@ def test_subprocess_timeout_and_collection_options(cloud, monkeypatch):
     assert "--no-resume" in command
     assert all(options == {"check": True, "timeout": 60} for _, options in commands)
     assert "--pilot-worker" in commands[2][0]
-    assert commands[2][0][-2:] == ["--score-chunk-size", "3"]
+    assert commands[2][0][-6:] == ["--score-chunk-size", "3", "--max-k", "30", "--every", "1"]
+
+
+@pytest.mark.parametrize("max_k,every", [(64, 2), (0, 1), (10000, 1)])
+def test_elicitation_options(monkeypatch, max_k, every):
+    commands = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda command, **kw: commands.append(command))
+    args = runner.parser().parse_args(
+        ["--workdir", ".", "--elicit-max-k", str(max_k), "--elicit-every", str(every)]
+    )
+    RUN_STAGE("elicit", args, 60)
+    assert commands[0][-6:] == [
+        "--score-chunk-size",
+        "8",
+        "--max-k",
+        str(max_k),
+        "--every",
+        str(every),
+    ]
 
 
 def test_timeout_is_reported(cloud, monkeypatch):
@@ -209,6 +227,10 @@ def test_collection_can_finish_in_flight_problem_and_run_pilots(cloud, monkeypat
         ["--stages", "collect,collect"],
         ["--lam", "-1"],
         ["--n-forced", "0"],
+        ["--elicit-max-k", "-1"],
+        ["--elicit-max-k", "10001"],
+        ["--elicit-every", "0"],
+        ["--elicit-every", "-1"],
     ],
 )
 def test_validation(flags):
