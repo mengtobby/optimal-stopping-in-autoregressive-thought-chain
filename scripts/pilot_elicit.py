@@ -18,7 +18,7 @@ def _json_value(value: Any) -> Any:
         return _json_value(value.tolist())
     if isinstance(value, dict):
         return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None
