@@ -85,6 +85,8 @@ def test_paired_comparison_validation_and_clusters():
     )
     with pytest.raises(HeadroomError, match="unknown method"):
         paired_comparison(data, "missing", "b")
+    with pytest.raises(HeadroomError, match="n_boot"):
+        paired_comparison(data, "a", "b", n_boot=0)
     for update, message in (
         ({"problem_ids": []}, "missing problem_ids"),
         ({"problem_ids": ["a"]}, "length mismatch"),

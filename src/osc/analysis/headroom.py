@@ -90,6 +90,8 @@ def paired_comparison(
     seed: int = 0,
 ) -> PairedComparison:
     """Compare saved per-trace payoffs with a problem-clustered paired interval."""
+    if isinstance(n_boot, bool) or not isinstance(n_boot, int) or n_boot < 1:
+        raise HeadroomError("n_boot must be a positive integer")
     data = report_to_json(report) if isinstance(report, HeadroomReport) else report
     clusters = data.get("problem_ids")
     if not isinstance(clusters, (list, tuple)) or not clusters:
@@ -445,8 +447,9 @@ def report_to_markdown(report: HeadroomReport) -> str:
                     "|---|---:|---|",
                 ]
             )
+            data = report_to_json(report)
             for row in comparisons:
-                paired = paired_comparison(report, row.method, "full-trace")
+                paired = paired_comparison(data, row.method, "full-trace")
                 lines.append(
                     f"| {row.method} | {number(paired.mean_difference)} | "
                     f"[{number(paired.ci[0])}, {number(paired.ci[1])}] |"
@@ -454,8 +457,8 @@ def report_to_markdown(report: HeadroomReport) -> str:
             lines.extend(
                 [
                     "",
-                    "Paired intervals resample problems jointly, so they are much narrower "
-                    "than comparing two marginal intervals.",
+                    "Paired intervals resample problems jointly; they are typically narrower "
+                    "than two marginal intervals when policies' payoffs are correlated.",
                 ]
             )
     lines.extend(

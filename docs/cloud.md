@@ -163,7 +163,9 @@ remove all saved copies after success; failed collection retains recovery copies
 existing traces. `--force` reruns selected stages; for collection it disables shard
 reuse and moves existing shards to `traces/shards.old-<timestamp>` before
 starting, so an early stop cannot mix previous and new shards. To regenerate reports explicitly, use
-`--stages headroom,elicit,flips --force`. To replace the saved problem list, select
+`--stages headroom,elicit,flips --force`. A completed elicit stage is not rerun when
+only `--elicit-max-k` or `--elicit-every` change, so pass `--stages elicit --force`
+after changing them. To replace the saved problem list, select
 collection and pass `--refresh-problems` (normally together with `--force` to
 recollect). This flag has no effect when collection is not selected. Use a fresh
 workdir when changing model, dataset, problem limit, seed, or collection settings
